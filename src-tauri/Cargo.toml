@@ -1,0 +1,29 @@
+[package]
+name = "sirvibe"
+version = "0.1.0"
+description = "SirVibe - a general-purpose local AI agent"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "io-util", "rt-multi-thread", "macros", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+walkdir = "2"
+base64 = "0.23.1"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

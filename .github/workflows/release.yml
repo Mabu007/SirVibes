@@ -1,0 +1,81 @@
+# Installers for a private sale: built on tag, attached to a draft release so
+# nothing is published until a human says so.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and attach to
+        required: true
+
+jobs:
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux (deb, rpm, AppImage)
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            label: macOS Apple Silicon
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            label: macOS Intel
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential curl wget file libssl-dev libxdo-dev libsoup-3.0-dev
+
+      - run: npm ci
+
+      # Signing is not set up yet. When it is, these secrets are what the
+      # Tauri action reads; until then the installers are unsigned and
+      # customers will see the usual first-run warning.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: SirVibe ${{ github.event.inputs.tag || github.ref_name }}
+          releaseBody: ${{ matrix.label }}
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}

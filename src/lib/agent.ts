@@ -1,5 +1,6 @@
 import { api } from "./api";
 import { deliverables } from "./deliverables";
+import type { SessionStatus } from "./sessions";
 import type {
   Artifact,
   ChatMessage,
@@ -32,6 +33,8 @@ export interface AgentHooks {
 export interface QuestionRequest {
   itemId: string;
   question: Question;
+  /** Which chat is asking. Filled in by the app when it raises the prompt. */
+  chatId?: string;
 }
 
 export interface ApprovalRequest {
@@ -39,6 +42,8 @@ export interface ApprovalRequest {
   tool: string;
   args: Record<string, unknown>;
   evaluation: Evaluation;
+  /** Which chat is asking. Filled in by the app when it raises the prompt. */
+  chatId?: string;
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -48,6 +53,9 @@ export class Agent {
   messages: ChatMessage[] = [];
   running = false;
   error: string | null = null;
+
+  /** True while the run is stopped at a prompt only the user can answer. */
+  private waiting = false;
 
   private hooks: AgentHooks;
   private activeStreamId: string | null = null;
@@ -59,6 +67,17 @@ export class Agent {
 
   constructor(hooks: AgentHooks) {
     this.hooks = hooks;
+  }
+
+  /**
+   * Where this chat stands, for the list and the status line. Derived rather
+   * than stored, so it cannot drift from what the agent is really doing.
+   */
+  get status(): SessionStatus {
+    if (this.running) return this.waiting ? "waiting" : "working";
+    if (this.error) return "error";
+    if (this.cancelled) return "cancelled";
+    return this.items.length ? "completed" : "idle";
   }
 
   // ------------------------------------------------------------- state
@@ -311,10 +330,14 @@ export class Agent {
       resultText: "",
     });
 
+    this.waiting = true;
+    this.hooks.onChange();
     const answer = await Promise.race([
       this.hooks.askUser({ itemId, question }),
       this.stopped(),
-    ]);
+    ]).finally(() => {
+      this.waiting = false;
+    });
 
     if (answer === "stopped" || answer === null) {
       this.update(itemId, { status: "cancelled", summary: "not answered" });
@@ -384,10 +407,14 @@ export class Agent {
 
     let approved = evaluation.decision === "allow";
     if (evaluation.decision === "ask") {
+      this.waiting = true;
+      this.hooks.onChange();
       const answer = await Promise.race([
         this.hooks.requestApproval({ itemId, tool: call.name, args, evaluation }),
         this.stopped(),
-      ]);
+      ]).finally(() => {
+        this.waiting = false;
+      });
       if (answer === "stopped") {
         this.update(itemId, { status: "cancelled", summary: "stopped" });
         this.messages.push({

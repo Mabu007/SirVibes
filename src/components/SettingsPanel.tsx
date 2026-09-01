@@ -27,10 +27,12 @@ const MODES: { value: PermissionMode; label: string; blurb: string }[] = [
 ];
 
 export function SettingsPanel({
+  account,
   settings,
   onSettings,
   onClose,
 }: {
+  account: { email: string; onSignOut: () => void };
   settings: SettingsView;
   onSettings: (s: SettingsView) => void;
   onClose: () => void;
@@ -72,19 +74,22 @@ export function SettingsPanel({
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-border bg-background-secondary text-muted">
             <AvatarIcon className="h-5 w-5" />
           </div>
-          <div className="min-w-0">
-            <div className="text-sm font-medium text-foreground">This computer</div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-medium text-foreground">{account.email}</div>
             <div className="truncate text-xs text-muted">
               {connected.length
-                ? `Signed in to ${connected.map((a) => a.name).join(", ")}`
-                : "No apps signed in yet"}
+                ? `Apps signed in: ${connected.map((a) => a.name).join(", ")}`
+                : "No apps connected yet"}
             </div>
           </div>
+          <Button size="sm" variant="secondary" onPress={account.onSignOut}>
+            Log out
+          </Button>
         </div>
         <p className="mt-2.5 text-xs text-muted">
-          SirVibe runs on your machine and has no account of its own — nothing to sign in to, and
-          nothing stored anywhere else. Your keys and your work stay here. Apps like Gmail or Drive
-          are signed in individually, and you can disconnect any of them from the Apps panel.
+          Your chats follow this account. Your keys, your workspace and everything you make stay on
+          this computer. Apps like Gmail or Instagram are signed in separately — you can connect or
+          disconnect any of them in the Apps panel.
         </p>
       </Section>
 

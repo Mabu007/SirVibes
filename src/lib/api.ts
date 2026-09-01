@@ -4,6 +4,7 @@ import type {
   ApiUsage,
   ApiView,
   AppsStatus,
+  SystemUsage,
   AppView,
   Artifact,
   AssistantMessage,
@@ -37,6 +38,8 @@ export const api = {
   skillImport: (sources: string[]) => invoke<ImportReport>("skill_import", { sources }),
   generateText: (prompt: string, system: string) =>
     invoke<string>("generate_text", { prompt, system }),
+  systemUsage: () => invoke<SystemUsage>("system_usage"),
+
   listCapabilities: () => invoke<Capability[]>("list_capabilities"),
   getSystemPrompt: () => invoke<string>("get_system_prompt"),
 

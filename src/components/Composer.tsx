@@ -1,7 +1,14 @@
 import { useEffect, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "@heroui/react";
+import type { PermissionMode } from "../lib/types";
 import { ArrowUpIcon, ChevronDownIcon, GlobeIcon, PaperclipIcon, StopIcon } from "./Icons";
+
+const MODE_LABEL: Record<PermissionMode, string> = {
+  ask: "Ask every time",
+  smart: "Smart",
+  full: "Full autonomy",
+};
 
 export function Composer({
   value,
@@ -13,6 +20,8 @@ export function Composer({
   onPickModel,
   needsSetup,
   onNeedsSetup,
+  mode,
+  onMode,
 }: {
   value: string;
   onChange: (text: string) => void;
@@ -23,6 +32,8 @@ export function Composer({
   onPickModel: () => void;
   needsSetup: boolean;
   onNeedsSetup: () => void;
+  mode: PermissionMode;
+  onMode: (mode: PermissionMode) => void;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -89,6 +100,25 @@ export function Composer({
             </Button>
 
             <div className="flex-1" />
+
+            {/* How much rope the agent has, next to the thing you are about to
+                ask it — not filed away in the window chrome. */}
+            <select
+              value={mode}
+              onChange={(e) => onMode(e.target.value as PermissionMode)}
+              aria-label="How much the agent may do on its own"
+              className={`rounded-lg border px-2 py-1 text-[12.5px] outline-none ${
+                mode === "full"
+                  ? "border-warning/50 bg-warning/10 text-warning-foreground"
+                  : "border-border bg-background text-muted"
+              }`}
+            >
+              {(Object.keys(MODE_LABEL) as PermissionMode[]).map((m) => (
+                <option key={m} value={m}>
+                  {MODE_LABEL[m]}
+                </option>
+              ))}
+            </select>
 
             {running ? (
               <Button variant="danger" size="sm" isIconOnly aria-label="Stop" onPress={onStop}>

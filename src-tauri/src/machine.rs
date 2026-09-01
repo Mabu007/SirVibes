@@ -220,3 +220,53 @@ mod tests {
         assert!(!encodes_a_frame(&nonsense));
     }
 }
+
+// ------------------------------------------------------------------ usage
+
+/// What the machine is doing right now, for the status line beside the profile.
+///
+/// Kept behind a single refreshed handle because processor load is a
+/// difference between two readings — asking once tells you nothing.
+#[derive(serde::Serialize, Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub cpu_percent: f32,
+    pub ram_used_gb: f32,
+    pub ram_total_gb: f32,
+}
+
+static SYSTEM: OnceLock<std::sync::Mutex<sysinfo::System>> = OnceLock::new();
+
+pub fn usage() -> Usage {
+    let handle = SYSTEM.get_or_init(|| std::sync::Mutex::new(sysinfo::System::new()));
+    let Ok(mut system) = handle.lock() else {
+        return Usage::default();
+    };
+
+    system.refresh_memory();
+    system.refresh_cpu_usage();
+
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    Usage {
+        cpu_percent: system.global_cpu_usage(),
+        ram_used_gb: (system.used_memory() as f64 / GB) as f32,
+        ram_total_gb: (system.total_memory() as f64 / GB) as f32,
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn the_machine_reports_something_plausible_about_itself() {
+        // The first reading of processor load has nothing to compare against,
+        // so take two.
+        let _ = usage();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let now = usage();
+
+        assert!(now.ram_total_gb > 0.1, "a machine with no memory: {:?}", now);
+        assert!(now.ram_used_gb > 0.0 && now.ram_used_gb <= now.ram_total_gb, "{:?}", now);
+        assert!((0.0..=100.0).contains(&now.cpu_percent), "{:?}", now);
+    }
+}

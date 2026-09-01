@@ -19,6 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures-util = "0.3"
 walkdir = "2"
 base64 = "0.23.1"
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

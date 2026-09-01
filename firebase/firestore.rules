@@ -1,0 +1,40 @@
+rules_version = '2';
+
+// SirVibe keeps very little in the cloud: who you are, what your chats are
+// called, and the conversation itself. Everything that matters in size or
+// secrecy — media, renders, API keys, the workspace — stays on the machine.
+//
+// The single rule this file exists to enforce: a signed-in person can reach
+// their own documents and nobody else's. The uid in the path must be the uid
+// on the request's token, which the client cannot forge.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      match /chats/{chatId} {
+        allow read, write: if isOwner(uid);
+
+        match /messages/{messageId} {
+          allow read, write: if isOwner(uid);
+        }
+      }
+
+      // Anything added under a user later inherits the same ownership test
+      // rather than defaulting to open.
+      match /{document=**} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    // Nothing else is readable or writable by a client, ever.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

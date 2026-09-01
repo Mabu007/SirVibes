@@ -241,6 +241,13 @@ fn find_program(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// What the machine is doing right now. Polled by the status line, so it is
+/// deliberately cheap and says nothing the user has to interpret.
+#[tauri::command]
+fn system_usage() -> machine::Usage {
+    machine::usage()
+}
+
 #[tauri::command]
 fn list_capabilities() -> Vec<Capability> {
     let mut found: Vec<Capability> = PROBED
@@ -2263,6 +2270,7 @@ fn main() {
             skill_import,
             generate_text,
             list_capabilities,
+            system_usage,
             get_system_prompt,
             evaluate_tool,
             run_tool,

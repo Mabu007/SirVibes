@@ -288,6 +288,13 @@ export interface AppView {
 }
 
 /** Whether connected apps are set up at all. Never carries the key. */
+/** What the machine is doing right now, for the status line. */
+export interface SystemUsage {
+  cpu_percent: number;
+  ram_used_gb: number;
+  ram_total_gb: number;
+}
+
 export interface AppsStatus {
   configured: boolean;
   key_hint: string;

@@ -32,7 +32,12 @@ export function SettingsPanel({
   onSettings,
   onClose,
 }: {
-  account: { email: string; onSignOut: () => void };
+  account: {
+    email: string;
+    /** Whether chats are reaching the account, or only this machine. */
+    cloud: "unknown" | "synced" | "local";
+    onSignOut: () => void;
+  };
   settings: SettingsView;
   onSettings: (s: SettingsView) => void;
   onClose: () => void;
@@ -80,6 +85,24 @@ export function SettingsPanel({
               {connected.length
                 ? `Apps signed in: ${connected.map((a) => a.name).join(", ")}`
                 : "No apps connected yet"}
+            </div>
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs">
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  account.cloud === "synced"
+                    ? "bg-success"
+                    : account.cloud === "local"
+                      ? "bg-warning"
+                      : "bg-border"
+                }`}
+              />
+              <span className="text-muted">
+                {account.cloud === "synced"
+                  ? "Chats synced to your account"
+                  : account.cloud === "local"
+                    ? "Saved on this computer only — cloud sync unavailable"
+                    : "Chats saved on this computer"}
+              </span>
             </div>
           </div>
           <Button size="sm" variant="secondary" onPress={account.onSignOut}>

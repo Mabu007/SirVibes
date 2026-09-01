@@ -131,6 +131,12 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<ConversationSummary | null>(null);
   const [done, setDone] = useState<{ id: string; title: string } | null>(null);
   const [user, setUser] = useState<User | null>(null);
+  /**
+   * Whether chats are actually reaching the account. A silent catch here once
+   * hid a database that was refusing every write, so this is reported rather
+   * than assumed.
+   */
+  const [cloud, setCloud] = useState<"unknown" | "synced" | "local">("unknown");
   const [authReady, setAuthReady] = useState(false);
   const userRef = useRef<User | null>(null);
   userRef.current = user;
@@ -340,8 +346,12 @@ export default function App() {
           updatedMs: Date.now(),
         });
         await saveMessages(who.uid, chatId, chat.messages as { role: string; content: string }[]);
-      } catch {
-        // Never let a sync problem lose the local save that already happened.
+        setCloud("synced");
+      } catch (error) {
+        // The local save already happened, so nothing is lost — but say so
+        // rather than letting a refused database look like a working one.
+        setCloud("local");
+        console.warn("chat did not reach the account:", error);
       }
     }
   };
@@ -704,7 +714,11 @@ export default function App() {
 
       {panel === "profile" && (
         <SettingsPanel
-          account={{ email: user.email ?? "Signed in", onSignOut: () => void signOutUser() }}
+          account={{
+            email: user.email ?? "Signed in",
+            cloud,
+            onSignOut: () => void signOutUser(),
+          }}
           settings={settings}
           onSettings={setSettings}
           onClose={() => setPanel(null)}

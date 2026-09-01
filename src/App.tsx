@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Avatar, Button } from "@heroui/react";
@@ -137,6 +137,24 @@ export default function App() {
 
   // A prompt belongs to the chat that raised it, so a question in one chat does
   // not appear over another and is still there when you come back to it.
+  /**
+   * Agents report every line of output, and several can be working at once.
+   * Rendering on each of those calls repainted the window about thirty times a
+   * second, which is not only wasteful: a button press is a gesture with a
+   * beginning and an end, and a tree churning underneath it loses the end. That
+   * is what made Stop unclickable while an agent was streaming. One repaint per
+   * frame keeps the UI live and the buttons pressable.
+   */
+  const repaintQueued = useRef(false);
+  const repaint = useCallback(() => {
+    if (repaintQueued.current) return;
+    repaintQueued.current = true;
+    requestAnimationFrame(() => {
+      repaintQueued.current = false;
+      setTick((t) => t + 1);
+    });
+  }, []);
+
   const resolveApproval = useRef(new Map<string, (approved: boolean) => void>());
   const resolveQuestion = useRef(new Map<string, (answer: string | null) => void>());
   const scroller = useRef<HTMLDivElement>(null);
@@ -152,7 +170,7 @@ export default function App() {
         new Agent({
           onChange: () => {
             storeRef.current?.refresh(chatId, activeIdRef.current === chatId);
-            setTick((t) => t + 1);
+            repaint();
           },
           requestApproval: (request) =>
             new Promise<boolean>((resolve) => {
@@ -176,7 +194,7 @@ export default function App() {
             setQuestion((q) => (q?.chatId === chatId ? null : q));
           },
         }),
-      () => setTick((t) => t + 1),
+      repaint,
     );
   }
   const sessions = storeRef.current;

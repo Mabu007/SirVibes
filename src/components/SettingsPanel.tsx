@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button, Chip } from "@heroui/react";
 import { api } from "../lib/api";
-import type { Capability, PermissionMode, SettingsView } from "../lib/types";
+import type { AppView, Capability, PermissionMode, SettingsView } from "../lib/types";
 import { Overlay } from "./Overlay";
+import { AvatarIcon } from "./Icons";
 
 const MODES: { value: PermissionMode; label: string; blurb: string }[] = [
   {
@@ -35,9 +36,13 @@ export function SettingsPanel({
   onClose: () => void;
 }) {
   const [caps, setCaps] = useState<Capability[]>([]);
+  const [apps, setApps] = useState<AppView[]>([]);
 
   useEffect(() => {
     api.listCapabilities().then(setCaps);
+    // The accounts this profile is signed in to already live in the apps
+    // registry; this is a read of that, not a second copy of it.
+    api.appsList().then(setApps).catch(() => setApps([]));
   }, []);
 
   const patch = async (p: Parameters<typeof api.updateSettings>[0]) => {
@@ -49,9 +54,11 @@ export function SettingsPanel({
     if (typeof picked === "string") await patch({ workspace: picked });
   };
 
+  const connected = apps.filter((a) => a.connected);
+
   return (
     <Overlay
-      title="Settings"
+      title="Profile"
       onClose={onClose}
       width="max-w-xl"
       footer={
@@ -60,6 +67,27 @@ export function SettingsPanel({
         </Button>
       }
     >
+      <Section label="Account">
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-border bg-background-secondary text-muted">
+            <AvatarIcon className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-foreground">This computer</div>
+            <div className="truncate text-xs text-muted">
+              {connected.length
+                ? `Signed in to ${connected.map((a) => a.name).join(", ")}`
+                : "No apps signed in yet"}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2.5 text-xs text-muted">
+          SirVibe runs on your machine and has no account of its own — nothing to sign in to, and
+          nothing stored anywhere else. Your keys and your work stay here. Apps like Gmail or Drive
+          are signed in individually, and you can disconnect any of them from the Apps panel.
+        </p>
+      </Section>
+
       <Section label="OpenRouter">
         <KeyField
           placeholder="sk-or-v1-…"
@@ -74,6 +102,25 @@ export function SettingsPanel({
         <Row label="Model">
           <code className="font-mono text-[12.5px]">{settings.model || "none selected"}</code>
         </Row>
+        <Row label="Vision model">
+          <VisionModelField
+            value={settings.vision_model}
+            onSave={(vision_model) => patch({ vision_model })}
+          />
+        </Row>
+        <Row label="Reference model">
+          <VisionModelField
+            value={settings.reference_model}
+            onSave={(reference_model) => patch({ reference_model })}
+          />
+        </Row>
+        <p className="mt-1.5 text-xs text-muted">
+          Every time the agent looks at something — a reference you gave it, a frame of your
+          footage, a render it just made — it runs on this model, whatever model is driving the
+          agent itself. Clear it to go back to the default. The reference model is the one that
+          watches a video you link to — a YouTube reference is watched where it is, never
+          downloaded.
+        </p>
       </Section>
 
       <Section label="Deepgram">
@@ -163,6 +210,33 @@ export function SettingsPanel({
         </p>
       </Section>
     </Overlay>
+  );
+}
+
+/** The one model the user does not pick per request: it is how the agent sees. */
+function VisionModelField({
+  value,
+  onSave,
+}: {
+  value: string;
+  onSave: (model: string) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+
+  const commit = () => {
+    if (draft.trim() !== value) void onSave(draft.trim());
+  };
+
+  return (
+    <input
+      value={draft}
+      spellCheck={false}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === "Enter" && commit()}
+      className="min-w-0 flex-1 rounded-lg border border-field-border bg-field px-2.5 py-1 font-mono text-[12.5px] outline-none focus:border-accent"
+    />
   );
 }
 

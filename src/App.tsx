@@ -4,11 +4,17 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Avatar, Button } from "@heroui/react";
 import { Agent, type ApprovalRequest } from "./lib/agent";
 import { api } from "./lib/api";
-import type { ConversationSummary, PermissionMode, SettingsView } from "./lib/types";
+import type {
+  ConversationSummary,
+  PermissionMode,
+  SettingsView,
+  ToolProgress,
+} from "./lib/types";
+import type { QuestionRequest } from "./lib/agent";
 import { ArtifactStrip } from "./components/ArtifactStrip";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { Composer } from "./components/Composer";
-import { CopyIcon, GearIcon, PanelIcon, RetryIcon } from "./components/Icons";
+import { AvatarIcon, CopyIcon, PanelIcon, RetryIcon } from "./components/Icons";
 import { Markdown } from "./components/Markdown";
 import { ModelPicker } from "./components/ModelPicker";
 import { WorkspacesModal } from "./components/WorkspacesModal";
@@ -16,6 +22,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { SetupModal } from "./components/SetupModal";
 import { Sidebar } from "./components/Sidebar";
 import { ApisModal } from "./components/ApisModal";
+import { AppsModal } from "./components/AppsModal";
 import { SkillsModal } from "./components/SkillsModal";
 import { ToolCard } from "./components/ToolCard";
 
@@ -37,7 +44,10 @@ export default function App() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [, setTick] = useState(0);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
-  const [panel, setPanel] = useState<null | "settings" | "models" | "setup" | "skills" | "workspaces" | "apis">(
+  const [question, setQuestion] = useState<QuestionRequest | null>(null);
+  const [panel, setPanel] = useState<
+    null | "profile" | "models" | "setup" | "skills" | "workspaces" | "apis" | "apps"
+  >(
     null,
   );
   const [collapsed, setCollapsed] = useState(false);
@@ -47,6 +57,7 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<ConversationSummary | null>(null);
 
   const resolveApproval = useRef<((approved: boolean) => void) | null>(null);
+  const resolveQuestion = useRef<((answer: string | null) => void) | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const agentRef = useRef<Agent | null>(null);
 
@@ -58,6 +69,22 @@ export default function App() {
           resolveApproval.current = resolve;
           setApproval(request);
         }),
+      closeApproval: () => {
+        resolveApproval.current = null;
+        setApproval(null);
+      },
+      askUser: (request) =>
+        new Promise<string | null>((resolve) => {
+          resolveQuestion.current = resolve;
+          setQuestion(request);
+        }),
+      // Stopping a run takes its question with it, and releases anything
+      // waiting on an answer that is never coming.
+      closeQuestion: () => {
+        resolveQuestion.current?.(null);
+        resolveQuestion.current = null;
+        setQuestion(null);
+      },
     });
   }
   const agent = agentRef.current;
@@ -76,8 +103,11 @@ export default function App() {
       listen<{ stream_id: string; kind: string; text: string }>("agent://delta", (e) =>
         agent.applyDelta(e.payload.stream_id, e.payload.kind, e.payload.text),
       ),
-      listen<{ call_id: string; line: string }>("agent://shell-output", (e) =>
-        agent.applyShellOutput(e.payload.call_id, e.payload.line),
+      listen<{ call_id: string; lines: string[] }>("agent://shell-output", (e) =>
+        agent.applyShellOutput(e.payload.call_id, e.payload.lines),
+      ),
+      listen<{ call_id: string } & ToolProgress>("agent://shell-progress", (e) =>
+        agent.applyShellProgress(e.payload.call_id, e.payload),
       ),
     ];
     return () => {
@@ -129,6 +159,12 @@ export default function App() {
   const send = async (text: string) => {
     await agent.send(text);
     await persist();
+  };
+
+  const answer = (choice: string | null) => {
+    resolveQuestion.current?.(choice);
+    resolveQuestion.current = null;
+    setQuestion(null);
   };
 
   const decide = (approved: boolean) => {
@@ -193,6 +229,7 @@ export default function App() {
         onSkills={() => setPanel("skills")}
         onWorkspaces={() => setPanel("workspaces")}
         onApis={() => setPanel("apis")}
+        onApps={() => setPanel("apps")}
         onChooseFolder={chooseWorkspace}
       />
 
@@ -228,9 +265,17 @@ export default function App() {
               </option>
             ))}
           </select>
-          <Button variant="secondary" size="sm" onPress={() => setPanel("settings")}>
-            <GearIcon />
-            Settings
+          {/* The account control, where a desktop app keeps it: top right, the
+              user's own corner of the window. */}
+          <Button
+            variant="ghost"
+            size="sm"
+            isIconOnly
+            aria-label="Profile"
+            onPress={() => setPanel("profile")}
+            className="h-9 w-9 rounded-full border border-border text-muted hover:text-foreground"
+          >
+            <AvatarIcon className="h-[18px] w-[18px]" />
           </Button>
         </header>
 
@@ -319,6 +364,8 @@ export default function App() {
                         item={item}
                         awaitingHere={approval?.itemId === item.id}
                         onDecide={decide}
+                        askingHere={question?.itemId === item.id}
+                        onAnswer={answer}
                       />
                     );
                   case "artifacts":
@@ -369,7 +416,7 @@ export default function App() {
           }}
         />
       )}
-      {panel === "settings" && (
+      {panel === "profile" && (
         <SettingsPanel
           settings={settings}
           onSettings={setSettings}
@@ -380,6 +427,7 @@ export default function App() {
         <SkillsModal settings={settings} onSettings={setSettings} onClose={() => setPanel(null)} />
       )}
       {panel === "apis" && <ApisModal onClose={() => setPanel(null)} />}
+      {panel === "apps" && <AppsModal onClose={() => setPanel(null)} />}
       {panel === "workspaces" && (
         <WorkspacesModal
           settings={settings}

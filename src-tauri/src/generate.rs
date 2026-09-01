@@ -332,7 +332,7 @@ fn attachment_part(ws: &Workspace, raw: &str) -> Result<Value, String> {
     })
 }
 
-fn text_of(message: &Value) -> String {
+pub fn text_of(message: &Value) -> String {
     match message.get("content") {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(parts)) => parts

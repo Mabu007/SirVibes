@@ -8,7 +8,7 @@ pub fn definitions() -> Value {
     json!([
         tool(
             "shell",
-            "Run a shell command inside the workspace. This is how you use ffmpeg, ffprobe, python, node, and any other program installed on this computer. Returns stdout, stderr, exit code and duration. Prefer one purposeful command at a time so you can inspect the result before continuing.",
+            "Run a shell command inside the workspace. This is how you use ffmpeg, ffprobe, python, node, and any other program installed on this computer. Returns stdout, stderr, exit code, duration, and a status of 'completed', 'cancelled' or 'timed_out'. Prefer one purposeful command at a time so you can inspect the result before continuing. The call returns when the command itself exits — anything it leaves running behind it is stopped along with it, so a service that is meant to outlive the command must be started detached (`setsid`/`nohup`).",
             json!({
                 "type": "object",
                 "properties": {
@@ -160,6 +160,36 @@ pub fn definitions() -> Value {
             })
         ),
         tool(
+            "list_connected_apps",
+            "List the external applications the user has connected through SirVibe's Apps panel — Gmail, GitHub, Google Drive and so on. These are the user's own accounts, already authorised. Call this when a task involves someone's email, calendar, files, repositories or messages, before assuming you cannot reach them.",
+            json!({ "type": "object", "properties": {} })
+        ),
+        tool(
+            "search_app_tools",
+            "Find the actions available on a connected application. Each app exposes many actions and you are not told about them up front — search for what you need, then call run_app_tool with the exact tool_slug this returns. Always search before acting: never invent a tool_slug.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What you are trying to do, e.g. 'send an email', 'create an issue', 'upload a file'." },
+                    "app": { "type": "string", "description": "Optional: restrict the search to one connected app, by the app_id from list_connected_apps." }
+                },
+                "required": ["query"]
+            })
+        ),
+        tool(
+            "run_app_tool",
+            "Run one action against a connected application, using the user's own authorised account. The user is shown what you are about to do and approves it first. You never see or supply the app's credentials — Composio holds them and applies them server-side. Use a tool_slug returned by search_app_tools, and supply arguments matching the schema it gave you.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tool_slug": { "type": "string", "description": "Exact tool slug from search_app_tools, e.g. 'GMAIL_SEND_EMAIL'." },
+                    "arguments": { "type": "object", "description": "Arguments for the action, matching the input schema from search_app_tools." },
+                    "purpose": { "type": "string", "description": "One short line on why this is needed. Shown to the user in the approval prompt." }
+                },
+                "required": ["tool_slug"]
+            })
+        ),
+        tool(
             "find_models",
             "Search the OpenRouter model catalogue the user's key has access to. Use this to find a model that produces a particular kind of output before calling run_model, and to check that a model id the user named actually exists. Reading the catalogue is free and needs no approval.",
             json!({
@@ -186,6 +216,91 @@ pub fn definitions() -> Value {
                     "purpose": { "type": "string", "description": "One short line on why this is needed. Shown to the user in the approval prompt." }
                 },
                 "required": ["model", "prompt"]
+            })
+        ),
+        tool(
+            "analyze_reference",
+            "Watch a video someone linked as a reference — \"make my captions look like this\", \"use              the editing style from this Reel\" — and get back a structured description of how it              was made. The video is watched where it lives: nothing is downloaded, and no copy is              kept. YouTube links work. Anything else (Instagram, a direct file link) cannot be              opened remotely, and the tool says so rather than fetching it — when that happens, ask              the user to add the clip to the chat and look at it with `see` instead. Set `scope` to              what the user actually asked about: analysing everything when they asked about captions              costs them money and buries the answer. Never reach for yt-dlp to get at a reference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The reference link, as the user gave it." },
+                    "scope": { "type": "string", "description": "What to study: 'captions', 'transitions', 'pacing', 'camera', 'graphics', 'color', 'audio', 'composition', or 'full' for the whole editing grammar. Default 'full'." },
+                    "start_seconds": { "type": "number", "description": "Report only on the reference from here. The whole video is still watched — this narrows what comes back, not what is sent." },
+                    "end_seconds": { "type": "number", "description": "Report only on the reference up to here." },
+                    "instruction": { "type": "string", "description": "What the user said they wanted from it, in their words. Steers what matters." },
+                    "save_as": { "type": "string", "description": "Workspace path for the analysis. Defaults to references/<video>-<scope>.json." },
+                    "purpose": { "type": "string", "description": "One short line on why. Shown to the user." }
+                },
+                "required": ["url"]
+            })
+        ),
+        tool(
+            "remember",
+            "Keep one short note that will be there at the start of every future conversation. \
+             Use it when you learn something durable: how this person likes their work done, what \
+             this project is and what it is for, a decision that should not be re-litigated, a \
+             path or account that keeps coming up. Do not use it for anything this conversation \
+             can already see, for transient state, or for a step you are about to take. Notes are \
+             short — one or two sentences. Give the same key again to correct or replace a note, \
+             and set forget to remove one that turned out to be wrong.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "'user' for how this person works, which follows them between projects; 'project' for what this piece of work is, which stays with the folder. Defaults to project." },
+                    "key": { "type": "string", "description": "A short handle, e.g. 'caption-style' or 'client'. The same key replaces the note that had it." },
+                    "value": { "type": "string", "description": "The note itself, in a sentence or two." },
+                    "forget": { "type": "boolean", "description": "Remove the note under this key instead of writing one." }
+                },
+                "required": ["key"]
+            })
+        ),
+        tool(
+            "ask_user",
+            "Ask the user one question and wait for their answer. Use this when the request leaves \
+             a choice open that would visibly change the result and you cannot infer which they \
+             want — what music to use when they asked for music but gave you no track, or which of \
+             several different looks they mean by a word like 'cinematic'. Do not use it for \
+             anything you can reasonably decide yourself: a question for every small choice is \
+             worse than a confident default. Ask about the result, never about how it is made — \
+             the person reading it does not know what a codec or a composition is, and should not \
+             have to. Offer two to four concrete options in plain language. One question at a time; \
+             work continues with their answer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question, in the user's own terms. One sentence." },
+                    "options": {
+                        "type": "array",
+                        "description": "Two to four choices, each describing an outcome the user can picture — not an implementation.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string", "description": "A few words, e.g. 'Use a song from my computer'." },
+                                "detail": { "type": "string", "description": "Optional: one line on what this would mean for the finished video." }
+                            },
+                            "required": ["label"]
+                        }
+                    },
+                    "allow_other": { "type": "boolean", "description": "Let the user type an answer of their own instead of choosing. Defaults to true." },
+                    "context": { "type": "string", "description": "Optional: one line on why you are asking, shown above the question." }
+                },
+                "required": ["question", "options"]
+            })
+        ),
+        tool(
+            "see",
+            "Look at an image, a frame, or a video and get back a description in words. This is how you see — you cannot look at a picture any other way, and neither can the model you are running on. Use it whenever a task turns on what something looks like: a reference the user handed you (\"make it look like this\"), a still, a screenshot, a logo, a frame you pulled out of footage, or a render of your own you need to check. Point it at a video and it takes frames across the whole clip for you. Set mode to 'style' when the point is to reproduce a look, and you get back a breakdown — palette, type, layout, grade, texture — specific enough to build from or to pass to a generative model.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The image or video to look at. A workspace path, or an absolute path the user gave you." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Several files to look at together, when they only make sense side by side." },
+                    "question": { "type": "string", "description": "What you need to know. Be specific — 'what typeface and colours does this use', 'is the caption legible against the background', 'what is written on the sign'. Defaults to a plain description." },
+                    "mode": { "type": "string", "description": "'describe' (default), or 'style' when the user wants their work to look like this reference." },
+                    "frames": { "type": "integer", "description": "How many frames to take from a video, spread across its length. Defaults to 4." },
+                    "purpose": { "type": "string", "description": "One short line on why. Shown to the user." }
+                }
             })
         ),
         tool(
@@ -235,4 +350,74 @@ fn tool(name: &str, description: &str, parameters: Value) -> Value {
         "type": "function",
         "function": { "name": name, "description": description, "parameters": parameters }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_named(name: &str) -> Value {
+        definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .unwrap_or_else(|| panic!("{} is not advertised to the model", name))
+            .clone()
+    }
+
+    #[test]
+    fn every_tool_the_runtime_runs_is_advertised_and_vice_versa() {
+        let advertised: Vec<String> = definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "shell", "fs_list", "fs_read", "fs_write", "fs_edit", "fs_mkdir", "fs_stat",
+            "list_skills", "read_skill", "list_apis", "search_api_capabilities", "read_api_docs",
+            "call_api", "configure_api", "list_connected_apps", "search_app_tools", "run_app_tool",
+            "find_models", "run_model", "see", "transcribe", "speak", "ask_user",
+            "analyze_reference", "remember",
+        ] {
+            assert!(advertised.contains(&expected.to_string()), "{} is missing", expected);
+        }
+        // Names must be unique, or the model cannot address them.
+        let mut sorted = advertised.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), advertised.len(), "a tool name is duplicated");
+    }
+
+    /// The frontend builds the question card straight from these arguments, so
+    /// the shape is a contract between the two halves of the app.
+    #[test]
+    fn the_question_tool_asks_for_what_the_question_card_renders() {
+        let ask = tool_named("ask_user");
+        let params = &ask["function"]["parameters"];
+        assert_eq!(params["required"], serde_json::json!(["question", "options"]));
+
+        let properties = &params["properties"];
+        assert_eq!(properties["question"]["type"], "string");
+        assert_eq!(properties["options"]["type"], "array");
+        assert_eq!(properties["options"]["items"]["properties"]["label"]["type"], "string");
+        assert_eq!(properties["options"]["items"]["required"], serde_json::json!(["label"]));
+        assert_eq!(properties["allow_other"]["type"], "boolean");
+
+        // And the description has to keep the agent out of technical language,
+        // because that is the whole point of asking.
+        let description = ask["function"]["description"].as_str().unwrap();
+        assert!(description.contains("plain language"), "{}", description);
+        assert!(description.contains("cannot infer"), "{}", description);
+    }
+
+    #[test]
+    fn the_shell_tool_states_its_completion_contract() {
+        let shell = tool_named("shell");
+        let description = shell["function"]["description"].as_str().unwrap();
+        for expected in ["cancelled", "timed_out", "exits"] {
+            assert!(description.contains(expected), "missing {:?}: {}", expected, description);
+        }
+    }
 }

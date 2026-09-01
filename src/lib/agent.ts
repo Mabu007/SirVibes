@@ -1,5 +1,15 @@
 import { api } from "./api";
-import type { Artifact, ChatMessage, Conversation, Evaluation, Item, ToolCall } from "./types";
+import { deliverables } from "./deliverables";
+import type {
+  Artifact,
+  ChatMessage,
+  Conversation,
+  Evaluation,
+  Item,
+  Question,
+  ToolCall,
+  ToolProgress,
+} from "./types";
 
 /** Safety net against a model that loops forever; the user can always continue. */
 const MAX_STEPS = 60;
@@ -8,6 +18,20 @@ export interface AgentHooks {
   onChange: () => void;
   /** Resolve true to run the action, false to refuse it. */
   requestApproval: (request: ApprovalRequest) => Promise<boolean>;
+  /** Take the approval prompt down: the run it belonged to is over. */
+  closeApproval: () => void;
+  /**
+   * Put a question to the user and wait. Resolves with what they chose, or
+   * null if they dismissed it without answering.
+   */
+  askUser: (request: QuestionRequest) => Promise<string | null>;
+  /** Take the question down: the run it belonged to is over. */
+  closeQuestion: () => void;
+}
+
+export interface QuestionRequest {
+  itemId: string;
+  question: Question;
 }
 
 export interface ApprovalRequest {
@@ -30,6 +54,8 @@ export class Agent {
   private activeAssistantId: string | null = null;
   private activeCallId: string | null = null;
   private cancelled = false;
+  /** Anyone waiting on "has the user pressed Stop yet". */
+  private stopWaiters: Array<() => void> = [];
 
   constructor(hooks: AgentHooks) {
     this.hooks = hooks;
@@ -55,6 +81,7 @@ export class Agent {
     this.messages = [];
     this.error = null;
     this.cancelled = false;
+    this.stopWaiters = [];
     this.hooks.onChange();
   }
 
@@ -75,11 +102,28 @@ export class Agent {
     this.hooks.onChange();
   }
 
-  /** Live stdout/stderr from a running command. */
-  applyShellOutput(callId: string, line: string) {
+  /**
+   * Where a long command has got to. One of these stands in for the hundreds of
+   * redraws a renderer or an encoder would otherwise send, so the run shows
+   * "55% · 207/375" instead of scrolling a bar past the user.
+   */
+  applyShellProgress(callId: string, progress: ToolProgress) {
     const item = this.items.find((i) => i.kind === "tool" && i.callId === callId);
     if (!item || item.kind !== "tool") return;
-    item.output.push(line);
+    item.progress = progress;
+    this.hooks.onChange();
+  }
+
+  /**
+   * Live stdout/stderr from a running command, in batches. A render prints a
+   * line per frame; one repaint per line is what makes the window stutter
+   * halfway through a long one.
+   */
+  applyShellOutput(callId: string, lines: string[]) {
+    if (!lines.length) return;
+    const item = this.items.find((i) => i.kind === "tool" && i.callId === callId);
+    if (!item || item.kind !== "tool") return;
+    item.output.push(...lines);
     if (item.output.length > 500) item.output.splice(0, item.output.length - 500);
     this.hooks.onChange();
   }
@@ -101,7 +145,18 @@ export class Agent {
     // Also stop whatever is executing, so Stop ends a long render rather than
     // just declining to start the next step.
     if (this.activeCallId) void api.cancelTool(this.activeCallId);
+    // And release anything waiting on the user — an approval prompt nobody is
+    // going to answer now would otherwise hold the run open indefinitely.
+    this.stopWaiters.splice(0).forEach((wake) => wake());
+    this.hooks.closeApproval();
+    this.hooks.closeQuestion();
     this.hooks.onChange();
+  }
+
+  /** Resolves when Stop is pressed. Never resolves otherwise. */
+  private stopped(): Promise<"stopped"> {
+    if (this.cancelled) return Promise.resolve("stopped");
+    return new Promise((resolve) => this.stopWaiters.push(() => resolve("stopped")));
   }
 
   // -------------------------------------------------------------- loop
@@ -110,6 +165,7 @@ export class Agent {
     if (this.running) return;
     this.running = true;
     this.cancelled = false;
+    this.stopWaiters = [];
     this.error = null;
     const turnStart = Date.now();
 
@@ -212,6 +268,82 @@ export class Agent {
     });
   }
 
+  /**
+   * The agent asking the user something. It is a tool call like any other — the
+   * model asks, an answer comes back — but the answer comes from the person
+   * rather than from the machine, so it is handled here instead of in the
+   * runtime. The run genuinely waits: the loop does not continue until there is
+   * an answer or the user has stopped it.
+   */
+  private async askQuestion(call: ToolCall, args: Record<string, unknown>) {
+    const rawOptions = Array.isArray(args.options) ? args.options : [];
+    const question: Question = {
+      question: String(args.question ?? "").trim() || "Which would you prefer?",
+      context: typeof args.context === "string" ? args.context : undefined,
+      options: rawOptions
+        .map((o) => {
+          const option = (o ?? {}) as Record<string, unknown>;
+          return {
+            label: String(option.label ?? "").trim(),
+            detail: typeof option.detail === "string" ? option.detail : undefined,
+          };
+        })
+        .filter((o) => o.label),
+      allowOther: args.allow_other !== false,
+    };
+    // A question with nothing to pick from would be a dead end; leave a way to
+    // answer it in words.
+    if (!question.options.length) question.allowOther = true;
+
+    const itemId = uid();
+    this.push({
+      kind: "tool",
+      id: itemId,
+      callId: call.id,
+      name: call.name,
+      title: "Question for you",
+      detail: question.question,
+      purpose: "",
+      status: "awaiting",
+      question,
+      summary: "",
+      output: [],
+      resultText: "",
+    });
+
+    const answer = await Promise.race([
+      this.hooks.askUser({ itemId, question }),
+      this.stopped(),
+    ]);
+
+    if (answer === "stopped" || answer === null) {
+      this.update(itemId, { status: "cancelled", summary: "not answered" });
+      this.messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({
+          ok: false,
+          cancelled: true,
+          error:
+            "The user did not answer. Do not ask again — either carry on with a sensible default and say which you chose, or stop and explain what you need.",
+        }),
+      });
+      return;
+    }
+
+    this.update(itemId, {
+      status: "ok",
+      summary: answer,
+      question: { ...question, answer },
+      resultText: `${question.question}\n\n${answer}`,
+    });
+    this.messages.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: JSON.stringify({ ok: true, result: { answer } }),
+    });
+  }
+
   private async runToolCall(call: ToolCall) {
     let args: Record<string, unknown>;
     try {
@@ -225,6 +357,11 @@ export class Agent {
           error: "Arguments were not valid JSON. Send the same call again with valid JSON.",
         }),
       });
+      return;
+    }
+
+    if (call.name === "ask_user") {
+      await this.askQuestion(call, args);
       return;
     }
 
@@ -247,12 +384,24 @@ export class Agent {
 
     let approved = evaluation.decision === "allow";
     if (evaluation.decision === "ask") {
-      approved = await this.hooks.requestApproval({
-        itemId,
-        tool: call.name,
-        args,
-        evaluation,
-      });
+      const answer = await Promise.race([
+        this.hooks.requestApproval({ itemId, tool: call.name, args, evaluation }),
+        this.stopped(),
+      ]);
+      if (answer === "stopped") {
+        this.update(itemId, { status: "cancelled", summary: "stopped" });
+        this.messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({
+            ok: false,
+            cancelled: true,
+            error: "The user stopped this run before approving the action.",
+          }),
+        });
+        return;
+      }
+      approved = answer;
       if (!approved) {
         this.update(itemId, { status: "denied", summary: "denied" });
       } else {
@@ -272,18 +421,22 @@ export class Agent {
 
     if (response.ok) {
       const result = response.result as Record<string, unknown>;
+      // A command the user stopped is not a failure to diagnose, and it is not
+      // a success either: it has an ending of its own.
+      const stopped = response.cancelled === true || result.status === "cancelled";
       const failed = call.name === "shell" && result.exit_code !== 0;
       this.update(itemId, {
-        status: failed ? "error" : "ok",
+        status: stopped ? "cancelled" : failed ? "error" : "ok",
         summary: summarize(call.name, result),
         resultText: previewOf(call.name, result),
         durationMs,
       });
     } else {
       const denied = evaluation.decision === "ask" && !approved;
+      const stopped = response.cancelled === true;
       this.update(itemId, {
-        status: denied ? "denied" : "error",
-        summary: denied ? "denied" : (response.error ?? "failed"),
+        status: denied ? "denied" : stopped ? "cancelled" : "error",
+        summary: denied ? "denied" : stopped ? "stopped" : (response.error ?? "failed"),
         resultText: response.error ?? "",
         durationMs,
       });
@@ -299,7 +452,8 @@ export class Agent {
   private async collectArtifacts(sinceMs: number) {
     try {
       const found: Artifact[] = await api.scanArtifacts(sinceMs);
-      if (found.length) this.push({ kind: "artifacts", id: uid(), items: found });
+      const shown = deliverables(found);
+      if (shown.length) this.push({ kind: "artifacts", id: uid(), items: shown });
     } catch {
       // A missing or unreadable workspace is already reported elsewhere.
     }
@@ -312,8 +466,13 @@ function describeArgs(tool: string, args: Record<string, unknown>): string {
   if (tool === "run_model") return String(args.model ?? "");
   if (tool === "configure_api") return String(args.api_id ?? "");
   if (tool === "speak") return String(args.text ?? "").slice(0, 90);
+  if (tool === "analyze_reference") return String(args.url ?? "");
+  if (tool === "see")
+    return String(args.path ?? (Array.isArray(args.paths) ? (args.paths as string[]).join(", ") : ""));
   if (tool === "read_api_docs") return String(args.api_id ?? "");
-  if (tool === "list_apis" || tool === "list_skills") return "";
+  if (tool === "search_app_tools") return String(args.query ?? "");
+  if (tool === "run_app_tool") return String(args.tool_slug ?? "");
+  if (tool === "list_apis" || tool === "list_skills" || tool === "list_connected_apps") return "";
   if (typeof args.path === "string") return args.path;
   if (typeof args.name === "string") return args.name;
   return "";
@@ -343,9 +502,10 @@ const list = (r: Record<string, unknown>, key: string): Record<string, unknown>[
 function summarize(tool: string, r: Record<string, unknown>): string {
   switch (tool) {
     case "shell": {
+      const secs = ((r.duration_ms as number) / 1000).toFixed(1);
+      if (r.status === "cancelled") return `stopped after ${secs}s`;
       if (r.timed_out) return "timed out";
       const code = r.exit_code;
-      const secs = ((r.duration_ms as number) / 1000).toFixed(1);
       return code === 0 ? `${secs}s` : `failed · exit ${code}`;
     }
     case "fs_list": {
@@ -422,10 +582,39 @@ function summarize(tool: string, r: Record<string, unknown>): string {
       const files = list(r, "files").length;
       return files ? count(files, "file") : "text only";
     }
+    case "analyze_reference": {
+      const analysis = (r.analysis ?? {}) as Record<string, unknown>;
+      const scope = String(r.scope ?? "full");
+      const block = (analysis[scope] ?? analysis) as Record<string, unknown>;
+      const notes = block.rebuildNotes ?? analysis.rebuildNotes;
+      return [
+        `${r.model} watched ${r.url} — nothing downloaded.`,
+        typeof notes === "string" ? notes : "",
+        `Saved to ${r.saved}`,
+        JSON.stringify(analysis, null, 2),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    case "see": {
+      const looked = list(r, "looked_at").length;
+      return looked ? `looked at ${count(looked, "image")}` : "looked";
+    }
+    case "analyze_reference": {
+      const confidence = typeof r.confidence === "number" ? Math.round(r.confidence * 100) : null;
+      return `${r.scope}${confidence === null ? "" : ` · ${confidence}% sure`}`;
+    }
     case "call_api": {
       const secs = ((r.duration_ms as number) / 1000).toFixed(1);
       return `${r.status} · ${secs}s`;
     }
+    case "list_connected_apps":
+      return count(list(r, "connected").length, "app");
+    case "search_app_tools":
+      return count(list(r, "matches").length, "action");
+    case "run_app_tool":
+      return String(r.app ?? "done");
     default:
       return "done";
   }
@@ -609,12 +798,50 @@ function previewOf(tool: string, r: Record<string, unknown>): string {
       return lines.join("\n\n") || `${r.model} returned nothing.`;
     }
 
+    case "see": {
+      const looked = list(r, "looked_at")
+        .map((l) =>
+          l.frame_at_seconds === undefined
+            ? String(l.path)
+            : `${l.path} at ${clock(l.frame_at_seconds as number)}`,
+        )
+        .join(", ");
+      const answer = String(r.answer ?? "").trim();
+      return looked ? `${looked}\n\n${answer}` : answer;
+    }
+
     case "call_api": {
       const secs = ((r.duration_ms as number) / 1000).toFixed(1);
       const header = `${r.api} answered ${r.status} in ${secs}s · ${bytes(
         (r.bytes as number) ?? 0,
       )}${r.truncated ? " (partial)" : ""}`;
       const body = readable(r.body).join("\n");
+      return body ? `${header}\n\n${body}` : header;
+    }
+
+    case "list_connected_apps": {
+      const connected = list(r, "connected");
+      if (!connected.length) return String(r.note ?? "No apps are connected.");
+      return connected
+        .map((a) => `${a.name}${a.ready ? "" : `  (${String(a.status).toLowerCase()})`}`)
+        .join("\n");
+    }
+
+    case "search_app_tools": {
+      const matches = list(r, "matches");
+      if (!matches.length) return String(r.note ?? "Nothing matched.");
+      return matches
+        .map((m) =>
+          [`${m.name || m.tool_slug}`, `  ${m.tool_slug}`, m.description && `  ${m.description}`]
+            .filter(Boolean)
+            .join("\n"),
+        )
+        .join("\n\n");
+    }
+
+    case "run_app_tool": {
+      const header = `${r.app} — ${r.tool_slug}`;
+      const body = readable(r.data).join("\n");
       return body ? `${header}\n\n${body}` : header;
     }
 

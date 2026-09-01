@@ -477,6 +477,8 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"shorts"), "got {:?}", names);
         assert!(names.contains(&"captions"));
+        assert!(names.contains(&"hyperframes"), "captions are built with it: {:?}", names);
+        assert!(names.contains(&"references"), "\"make it look like this\": {:?}", names);
         assert!(names.contains(&"video-analysis"));
         assert!(names.contains(&"podcast-editing"));
         assert!(found.iter().all(|s| !s.description.is_empty()));

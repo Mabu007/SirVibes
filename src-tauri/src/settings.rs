@@ -26,6 +26,14 @@ pub struct Settings {
     /// generic API connection.
     pub deepgram_api_key: String,
     pub model: String,
+    /// The model every `see` call runs on. Vision is a fixed capability rather
+    /// than a per-call choice, so it does not follow the agent's own model —
+    /// empty means the built-in default in `vision::DEFAULT_MODEL`.
+    pub vision_model: String,
+    /// The model that watches a reference video where it lives. Not the same
+    /// job as `vision_model`: only some providers can open a YouTube link at
+    /// all. Empty means the built-in default in `reference::DEFAULT_MODEL`.
+    pub reference_model: String,
     pub permission_mode: PermissionMode,
     pub workspace: Option<String>,
     /// Extra directories scanned for skills, in addition to the bundled and
@@ -36,6 +44,10 @@ pub struct Settings {
     pub recent_workspaces: Vec<String>,
     #[serde(default = "default_timeout")]
     pub shell_timeout_secs: u64,
+    /// Stable local identity for this install, used as Composio's `user_id` so
+    /// connected apps belong to this user rather than to the project as a
+    /// whole. Generated once, on first use, and never shown to the model.
+    pub composio_user_id: String,
 }
 
 /// What the frontend is allowed to see. The API key never crosses the IPC
@@ -47,6 +59,11 @@ pub struct SettingsView {
     pub deepgram_key_set: bool,
     pub deepgram_key_hint: String,
     pub model: String,
+    /// What `see` actually runs on, default included, so the UI can show it
+    /// without knowing the default.
+    pub vision_model: String,
+    /// What watches reference videos, default included.
+    pub reference_model: String,
     pub permission_mode: PermissionMode,
     pub workspace: Option<String>,
     pub skill_dirs: Vec<String>,
@@ -64,6 +81,12 @@ impl Settings {
             deepgram_key_set: !deepgram.is_empty(),
             deepgram_key_hint: hint(deepgram),
             model: self.model.clone(),
+            vision_model: crate::vision::model_for(&self.vision_model).to_string(),
+            reference_model: if self.reference_model.trim().is_empty() {
+                crate::reference::DEFAULT_MODEL.to_string()
+            } else {
+                self.reference_model.trim().to_string()
+            },
             permission_mode: self.permission_mode,
             workspace: self.workspace.clone(),
             skill_dirs: self.skill_dirs.clone(),
@@ -86,6 +109,16 @@ impl Settings {
         }
     }
 
+    /// The identity connected apps are scoped to. Created on first use; the
+    /// caller persists the settings when this returns true in `created`.
+    pub fn ensure_composio_user_id(&mut self) -> (String, bool) {
+        if !self.composio_user_id.trim().is_empty() {
+            return (self.composio_user_id.clone(), false);
+        }
+        self.composio_user_id = generate_user_id();
+        (self.composio_user_id.clone(), true)
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -95,6 +128,28 @@ impl Settings {
         restrict_permissions(path);
         Ok(())
     }
+}
+
+/// A local identifier with no personal information in it. This is not a
+/// security boundary — it is a stable name for "the person using this install",
+/// which is what Composio needs in order to keep connections apart.
+fn generate_user_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // A counter as well as the clock, so two ids minted in the same nanosecond
+    // still differ.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed) as u128;
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(pid << 17)
+        .wrapping_add(seq.wrapping_mul(0xD1B5_4A32_D192_ED03));
+    format!("sirvibe-{:032x}", mixed)
 }
 
 /// Enough of a key to recognise it, never enough to use it.
@@ -125,6 +180,8 @@ pub struct SettingsPatch {
     pub api_key: Option<String>,
     pub deepgram_api_key: Option<String>,
     pub model: Option<String>,
+    pub vision_model: Option<String>,
+    pub reference_model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub workspace: Option<String>,
     pub skill_dirs: Option<Vec<String>>,
@@ -141,6 +198,12 @@ impl Settings {
         }
         if let Some(m) = patch.model {
             self.model = m.trim().to_string();
+        }
+        if let Some(m) = patch.vision_model {
+            self.vision_model = m.trim().to_string();
+        }
+        if let Some(m) = patch.reference_model {
+            self.reference_model = m.trim().to_string();
         }
         if let Some(p) = patch.permission_mode {
             self.permission_mode = p;
@@ -268,6 +331,33 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         let loaded = Settings::load(&path);
         assert_eq!(loaded.permission_mode, PermissionMode::Smart);
+    }
+
+    #[test]
+    fn the_local_identity_is_generated_once_and_then_kept() {
+        let mut s = Settings::default();
+        assert!(s.composio_user_id.is_empty());
+
+        let (first, created) = s.ensure_composio_user_id();
+        assert!(created, "the first call creates it");
+        assert!(first.starts_with("sirvibe-"));
+
+        let (second, created_again) = s.ensure_composio_user_id();
+        assert!(!created_again, "it is only ever created once");
+        assert_eq!(first, second, "the identity must be stable");
+
+        // And it survives a round trip, or every restart would orphan the
+        // user's connected apps.
+        let path = temp("identity");
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).composio_user_id, first);
+    }
+
+    #[test]
+    fn two_installs_do_not_collide_on_one_identity() {
+        let mut a = Settings::default();
+        let mut b = Settings::default();
+        assert_ne!(a.ensure_composio_user_id().0, b.ensure_composio_user_id().0);
     }
 
     #[test]

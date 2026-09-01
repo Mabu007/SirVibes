@@ -60,6 +60,36 @@ pub enum ApiTarget {
     Unusable { api_name: String, reason: String },
 }
 
+/// Everything the runtime needs to describe a pending connected-app action to
+/// the user. Built natively from the local registry and the tool schema that
+/// Composio returned — never from model output alone, and never containing a
+/// credential.
+#[derive(Clone, Debug, Default)]
+pub struct AppCallInfo {
+    pub app_name: String,
+    pub tool_slug: String,
+    /// Human wording for the action, from Composio's own tool description.
+    pub action: String,
+    pub purpose: String,
+    /// The argument names being sent, for the approval prompt. Names only —
+    /// values can carry the user's own content and are not summarised here.
+    pub argument_names: Vec<String>,
+}
+
+/// Why a `run_app_tool` request cannot be performed. As with APIs, these are
+/// different failures and must not be reported as the same thing.
+#[derive(Clone, Debug)]
+pub enum AppTarget {
+    /// The action resolves to a connected app that is ready to use.
+    Ready(AppCallInfo),
+    /// The tool exists but the app behind it is not connected for this user.
+    NotConnected { app: String },
+    /// Connected, but not in a state that can run anything.
+    Unusable { app_name: String, reason: String },
+    /// Composio itself is unavailable — no key, or the lookup failed.
+    Unavailable { reason: String },
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Evaluation {
     pub decision: Decision,
@@ -124,13 +154,15 @@ pub fn evaluate(
     args: &Value,
     workspace: Option<&Workspace>,
     api: Option<&ApiTarget>,
+    app: Option<&AppTarget>,
 ) -> Evaluation {
     // Capability tools are answered before the workspace check: they read the
     // agent's own catalogues or talk to a remote service, and none of them
     // touch the local filesystem.
     match tool {
         // Reading a catalogue costs nothing and touches nothing.
-        "list_apis" | "search_api_capabilities" | "read_api_docs" | "find_models" => {
+        "list_apis" | "search_api_capabilities" | "read_api_docs" | "find_models"
+        | "list_connected_apps" | "search_app_tools" => {
             return Evaluation {
                 decision: Decision::Allow,
                 title: tool_title(tool).to_string(),
@@ -138,10 +170,44 @@ pub fn evaluate(
                 risks: Vec::new(),
             }
         }
+        // Asking a question changes nothing and spends nothing; it is answered
+        // in the conversation, by the user, and needs no approval of its own.
+        "ask_user" => {
+            return Evaluation {
+                decision: Decision::Allow,
+                title: tool_title("ask_user").to_string(),
+                detail: args
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                risks: Vec::new(),
+            }
+        }
+        // A note to itself. It writes a small file the user can read and
+        // delete, reaches nothing outside the machine, and spends nothing.
+        "remember" => {
+            return Evaluation {
+                decision: Decision::Allow,
+                title: tool_title("remember").to_string(),
+                detail: format!(
+                    "{}{}",
+                    args.get("key").and_then(Value::as_str).unwrap_or_default(),
+                    args.get("value")
+                        .and_then(Value::as_str)
+                        .map(|v| format!(": {}", v))
+                        .unwrap_or_default()
+                ),
+                risks: Vec::new(),
+            }
+        }
         "call_api" => return evaluate_api_call(api),
+        "run_app_tool" => return evaluate_app_tool(app),
         "run_model" => return evaluate_generation(args, workspace),
         "configure_api" => return evaluate_configure(args),
         "transcribe" | "speak" => return evaluate_speech(mode, tool, args, workspace),
+        "see" => return evaluate_vision(mode, args, workspace),
+        "analyze_reference" => return evaluate_reference(mode, args, workspace),
         _ => {}
     }
 
@@ -194,7 +260,10 @@ pub fn evaluate(
     };
 
     let has_outside = risks.iter().any(|r| r.kind == "outside_workspace");
-    let decision = if risks.iter().any(|r| r.kind == "unknown_tool") {
+    let decision = if risks
+        .iter()
+        .any(|r| r.kind == "unknown_tool" || r.kind == "legacy_captions")
+    {
         Decision::Deny
     } else {
         match mode {
@@ -297,6 +366,82 @@ fn evaluate_api_call(api: Option<&ApiTarget>) -> Evaluation {
             format!("{} {}", api.method, api.url)
         } else {
             format!("{}\n\n{} {}", api.purpose, api.method, api.url)
+        },
+        risks,
+    }
+}
+
+/// Acting on a connected application touches the user's own real account —
+/// their mail, their files, their repositories. That is approved in every
+/// permission mode, including Full: workspace autonomy is autonomy over the
+/// workspace, and someone's inbox is not in it.
+fn evaluate_app_tool(app: Option<&AppTarget>) -> Evaluation {
+    let info = match app {
+        Some(AppTarget::Ready(info)) => info,
+        Some(AppTarget::Unusable { app_name, reason }) => {
+            return Evaluation {
+                decision: Decision::Deny,
+                title: format!("{} · not usable", app_name),
+                detail: reason.clone(),
+                risks: vec![Risk::new("app_not_usable", reason.clone())],
+            }
+        }
+        Some(AppTarget::NotConnected { app }) => {
+            return Evaluation {
+                decision: Decision::Deny,
+                title: "Connected app action".into(),
+                detail: String::new(),
+                risks: vec![Risk::new(
+                    "app_not_connected",
+                    format!(
+                        "{} is not connected. The user connects apps in SirVibe's Apps panel, in the sidebar; list_connected_apps shows what is already there.",
+                        app
+                    ),
+                )],
+            }
+        }
+        Some(AppTarget::Unavailable { reason }) => {
+            return Evaluation {
+                decision: Decision::Deny,
+                title: "Connected app action".into(),
+                detail: String::new(),
+                risks: vec![Risk::new("apps_unavailable", reason.clone())],
+            }
+        }
+        None => {
+            return Evaluation {
+                decision: Decision::Deny,
+                title: "Connected app action".into(),
+                detail: String::new(),
+                risks: vec![Risk::new(
+                    "app_not_connected",
+                    "No connected app was named. Use search_app_tools to find an action first.",
+                )],
+            }
+        }
+    };
+
+    let mut risks = vec![Risk::new(
+        "connected_app",
+        format!(
+            "Acts on your own {} account through Composio, using the access you granted when you connected it.",
+            info.app_name
+        ),
+    )];
+    if !info.argument_names.is_empty() {
+        risks.push(Risk::new(
+            "parameters",
+            format!("Sends: {}", info.argument_names.join(", ")),
+        ));
+    }
+
+    Evaluation {
+        decision: Decision::Ask,
+        title: format!("{} · {}", info.app_name, info.action),
+        detail: if info.purpose.is_empty() {
+            info.tool_slug.clone()
+        } else {
+            format!("{}\n\n{}", info.purpose, info.tool_slug)
         },
         risks,
     }
@@ -533,6 +678,117 @@ fn evaluate_speech(
     }
 }
 
+/// Looking sends the user's pictures to a model and costs them money, so it is
+/// treated like the other outside calls: unattended only under full autonomy,
+/// and only for files that are already inside the workspace. A reference the
+/// user handed us from elsewhere on their disk is still worth a glance before
+/// it is uploaded.
+fn evaluate_vision(mode: PermissionMode, args: &Value, workspace: Option<&Workspace>) -> Evaluation {
+    let Some(ws) = workspace else {
+        return Evaluation {
+            decision: Decision::Deny,
+            title: tool_title("see").to_string(),
+            detail: String::new(),
+            risks: vec![Risk::new(
+                "no_workspace",
+                "No workspace is selected, so there is nothing to look at yet.",
+            )],
+        };
+    };
+
+    let paths = match crate::vision::paths_of(args) {
+        Ok(paths) => paths,
+        Err(why) => {
+            return Evaluation {
+                decision: Decision::Deny,
+                title: tool_title("see").to_string(),
+                detail: String::new(),
+                risks: vec![Risk::new("invalid", why)],
+            }
+        }
+    };
+
+    let mut risks = vec![Risk::new(
+        "external_model",
+        "Uploads these files to the vision model on OpenRouter and charges the request to your OpenRouter account.",
+    )];
+    for path in &paths {
+        risks.extend(path_risks(path, ws, "read"));
+    }
+    let risks = dedupe(risks);
+
+    let purpose = args.get("purpose").and_then(Value::as_str).unwrap_or("");
+    let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+    let detail = [paths.join(", "), purpose.to_string(), question.to_string()]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ");
+
+    let decision = match mode {
+        PermissionMode::Full if !risks.iter().any(|r| r.kind == "outside_workspace") => {
+            Decision::Allow
+        }
+        _ => Decision::Ask,
+    };
+
+    Evaluation {
+        decision,
+        title: tool_title("see").to_string(),
+        detail,
+        risks,
+    }
+}
+
+/// Watching a reference sends a link to a model and charges the user for the
+/// time it spends watching, so it is shown like any other outside call. Nothing
+/// leaves the machine except the link itself.
+fn evaluate_reference(mode: PermissionMode, args: &Value, workspace: Option<&Workspace>) -> Evaluation {
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Evaluation {
+            decision: Decision::Deny,
+            title: tool_title("analyze_reference").to_string(),
+            detail: String::new(),
+            risks: vec![Risk::new("invalid", "No reference link was given.")],
+        };
+    }
+    if workspace.is_none() {
+        return Evaluation {
+            decision: Decision::Deny,
+            title: tool_title("analyze_reference").to_string(),
+            detail: url,
+            risks: vec![Risk::new(
+                "no_workspace",
+                "No workspace is selected, so there is nowhere to keep what comes back.",
+            )],
+        };
+    }
+
+    let scope = args.get("scope").and_then(Value::as_str).unwrap_or("full");
+    let risks = vec![Risk::new(
+        "external_model",
+        "Sends this link to a model that watches the video where it lives, and charges the time 
+         to your OpenRouter account — the longer the video, the more it costs. The video 
+         is not downloaded and no copy is kept.",
+    )];
+
+    Evaluation {
+        decision: match mode {
+            PermissionMode::Full => Decision::Allow,
+            _ => Decision::Ask,
+        },
+        title: format!("Watch a reference · {}", scope),
+        detail: url,
+        risks,
+    }
+}
+
 fn tool_title(tool: &str) -> &'static str {
     match tool {
         "shell" => "Run shell command",
@@ -548,11 +804,18 @@ fn tool_title(tool: &str) -> &'static str {
         "search_api_capabilities" => "Search API capabilities",
         "read_api_docs" => "Read API documentation",
         "call_api" => "API call request",
+        "list_connected_apps" => "List connected apps",
+        "search_app_tools" => "Search app actions",
+        "run_app_tool" => "Connected app action",
         "find_models" => "Search models",
         "configure_api" => "Set up an API",
         "transcribe" => "Transcribe speech",
         "speak" => "Generate a voiceover",
         "run_model" => "Generate with a model",
+        "see" => "Look at an image",
+        "ask_user" => "Question for you",
+        "remember" => "Remember this",
+        "analyze_reference" => "Watch a reference video",
         _ => "Unknown action",
     }
 }
@@ -671,10 +934,65 @@ fn program_of(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// `npx` runs whatever npm hands it, which is worth a look — except for the one
+/// package this app is built around. HyperFrames is how captions and motion
+/// graphics are rendered here, and it is normally reached through npx rather
+/// than installed; prompting for every render would train the user to click
+/// through the prompt that matters.
+fn is_hyperframes(program: &str, sub: Option<&str>) -> bool {
+    program == "npx"
+        && sub
+            .map(|target| target == "hyperframes" || target.starts_with("hyperframes@"))
+            .unwrap_or(false)
+}
+
+/// The old caption path, refused by the runtime rather than merely discouraged.
+///
+/// Captions here are HyperFrames compositions composited as a transparent
+/// overlay. Burning text in with libass is the system that used to compete with
+/// it, and two caption systems is worse than either: it is the reason a video
+/// could come back with the designed captions *and* a row of default subtitles.
+/// An `.srt` or `.vtt` sidecar is untouched — that is a deliverable, not a way
+/// of putting words on the picture.
+fn legacy_caption_use(cmd: &str) -> Option<String> {
+    let lower = cmd.to_lowercase();
+    let filtering = ["-vf", "-filter_complex", "-filter:v", "-af"]
+        .iter()
+        .any(|flag| lower.contains(flag));
+
+    if lower.contains("subtitles=") {
+        return Some("the `subtitles=` filter".into());
+    }
+    if filtering && lower.contains("ass=") {
+        return Some("the `ass=` subtitle filter".into());
+    }
+    if lower.contains("-c:s ass") || lower.contains("-c:s ssa") || lower.contains("-scodec ass") {
+        return Some("an ASS subtitle track".into());
+    }
+    for token in tokenize(cmd) {
+        let cleaned = token.trim_matches(|c| c == '"' || c == '\'').to_lowercase();
+        if cleaned.ends_with(".ass") || cleaned.ends_with(".ssa") {
+            return Some(format!("an ASS subtitle file ({})", token));
+        }
+    }
+    None
+}
+
 fn analyze_shell(cmd: &str, ws: &Workspace) -> Vec<Risk> {
     let mut risks: Vec<Risk> = Vec::new();
     if cmd.trim().is_empty() {
         return vec![Risk::new("invalid", "Empty command")];
+    }
+    if let Some(what) = legacy_caption_use(cmd) {
+        risks.push(Risk::new(
+            "legacy_captions",
+            format!(
+                "This command uses {}. Captions in SirVibe are HyperFrames compositions rendered \
+                 transparent and composited on — read the `hyperframes` skill. Writing an `.srt` \
+                 or `.vtt` sidecar is still fine; burning subtitles into the picture is not.",
+                what
+            ),
+        ));
     }
 
     let segments = split_segments(cmd);
@@ -712,7 +1030,7 @@ fn analyze_shell(cmd: &str, ws: &Workspace) -> Vec<Risk> {
                 format!("Controls system state or processes (`{}`)", program),
             ));
         }
-        if PACKAGE_ALWAYS.contains(&program.as_str()) {
+        if PACKAGE_ALWAYS.contains(&program.as_str()) && !is_hyperframes(&program, sub) {
             risks.push(Risk::new(
                 "package_install",
                 format!("Installs or runs downloaded software (`{}`)", program),
@@ -868,10 +1186,98 @@ mod tests {
     }
 
     #[test]
+    fn watching_a_reference_is_shown_before_it_is_paid_for() {
+        let w = ws();
+        let args = serde_json::json!({
+            "url": "https://youtu.be/aqz-KE-bpKQ",
+            "scope": "captions"
+        });
+        for mode in [PermissionMode::Ask, PermissionMode::Smart] {
+            let e = evaluate(mode, "analyze_reference", &args, Some(&w), None, None);
+            assert_eq!(e.decision, Decision::Ask);
+            assert!(e.detail.contains("youtu.be"), "{}", e.detail);
+            assert!(e.title.contains("captions"), "{}", e.title);
+            assert!(
+                e.risks[0].message.contains("not downloaded"),
+                "the user should be told it stays where it is: {}",
+                e.risks[0].message
+            );
+            assert!(
+                e.risks[0].message.contains("the more it costs"),
+                "and what drives the price: {}",
+                e.risks[0].message
+            );
+        }
+        assert_eq!(
+            evaluate(PermissionMode::Full, "analyze_reference", &args, Some(&w), None, None).decision,
+            Decision::Allow
+        );
+        // And a call with no link is refused rather than sent.
+        assert_eq!(
+            evaluate(PermissionMode::Full, "analyze_reference", &serde_json::json!({}), Some(&w), None, None)
+                .decision,
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn burning_in_subtitles_is_refused_outright() {
+        let w = ws();
+        for command in [
+            "ffmpeg -i in.mp4 -vf subtitles=out/captions.srt out.mp4",
+            "ffmpeg -i in.mp4 -vf ass=out/captions.ass out.mp4",
+            "ffmpeg -i in.mp4 -i captions.ass -c:s ass out.mkv",
+            "ffmpeg -i in.mp4 -filter_complex \"[0:v]subtitles=c.srt[v]\" -map [v] out.mp4",
+        ] {
+            let args = serde_json::json!({ "command": command });
+            let e = evaluate(PermissionMode::Full, "shell", &args, Some(&w), None, None);
+            assert_eq!(e.decision, Decision::Deny, "should be refused: {}", command);
+            assert!(
+                e.risks.iter().any(|r| r.kind == "legacy_captions"),
+                "and say why: {:?}",
+                e.risks
+            );
+            assert!(
+                e.risks[0].message.contains("hyperframes"),
+                "and say what to do instead: {}",
+                e.risks[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_caption_work_is_not_caught_by_that() {
+        let w = ws();
+        let allowed = [
+            // The composite the caption pipeline actually performs.
+            "ffmpeg -i cut.mp4 -c:v libvpx-vp9 -i overlay.webm -filter_complex '[0:v][1:v]overlay=0:0' out.mp4",
+            // A sidecar subtitle file is a deliverable.
+            "cp out/transcripts/africa.srt out/final.srt",
+            // A soft subtitle track is not burned-in text.
+            "ffmpeg -i in.mp4 -i subs.srt -c copy -c:s mov_text out.mp4",
+            // And a filename is not a filter.
+            "ffmpeg -i grass.mp4 -c:v libx264 out.mp4",
+        ];
+        for command in allowed {
+            let args = serde_json::json!({ "command": command });
+            let e = evaluate(PermissionMode::Full, "shell", &args, Some(&w), None, None);
+            assert_ne!(e.decision, Decision::Deny, "should be allowed: {}", command);
+        }
+    }
+
+    #[test]
     fn destructive_and_privileged_commands_are_flagged() {
         assert!(kinds("rm -rf renders/").contains(&"destructive".to_string()));
         assert!(kinds("sudo apt install ffmpeg").contains(&"privilege".to_string()));
         assert!(kinds("npm install left-pad").contains(&"package_install".to_string()));
+    }
+
+    #[test]
+    fn rendering_through_npx_is_routine_but_npx_in_general_is_not() {
+        assert!(kinds("npx -y hyperframes@latest render --format webm -o o.webm").is_empty());
+        assert!(kinds("npx hyperframes check").is_empty());
+        assert!(kinds("npx some-other-package").contains(&"package_install".to_string()));
+        assert!(kinds("npx -y hyperframes-lookalike").contains(&"package_install".to_string()));
     }
 
     #[test]
@@ -895,22 +1301,59 @@ mod tests {
     }
 
     #[test]
+    fn looking_at_a_workspace_file_runs_unattended_only_under_full_autonomy() {
+        let w = ws();
+        let args = serde_json::json!({ "path": "reference.png", "purpose": "match this style" });
+        assert_eq!(
+            evaluate(PermissionMode::Full, "see", &args, Some(&w), None, None).decision,
+            Decision::Allow
+        );
+        for mode in [PermissionMode::Smart, PermissionMode::Ask] {
+            let e = evaluate(mode, "see", &args, Some(&w), None, None);
+            assert_eq!(e.decision, Decision::Ask, "looking costs money, so it is shown first");
+            assert!(
+                e.risks.iter().any(|r| r.kind == "external_model"),
+                "the user should be told where the picture is going: {:?}",
+                e.risks
+            );
+            assert!(e.detail.contains("reference.png"), "{}", e.detail);
+        }
+    }
+
+    #[test]
+    fn a_reference_from_outside_the_workspace_is_always_shown_before_it_is_uploaded() {
+        let w = ws();
+        let args = serde_json::json!({ "paths": ["/home/someone/moodboard.png"] });
+        let e = evaluate(PermissionMode::Full, "see", &args, Some(&w), None, None);
+        assert_eq!(e.decision, Decision::Ask);
+        assert!(e.risks.iter().any(|r| r.kind == "outside_workspace"), "{:?}", e.risks);
+    }
+
+    #[test]
+    fn looking_at_nothing_is_refused_rather_than_sent() {
+        let w = ws();
+        let e = evaluate(PermissionMode::Full, "see", &serde_json::json!({}), Some(&w), None, None);
+        assert_eq!(e.decision, Decision::Deny);
+        assert!(e.risks.iter().any(|r| r.kind == "invalid"), "{:?}", e.risks);
+    }
+
+    #[test]
     fn full_autonomy_still_stops_at_the_workspace_edge() {
         let w = ws();
         let args = serde_json::json!({ "command": "cat /etc/passwd" });
-        let e = evaluate(PermissionMode::Full, "shell", &args, Some(&w), None);
+        let e = evaluate(PermissionMode::Full, "shell", &args, Some(&w), None, None);
         assert_eq!(e.decision, Decision::Ask);
         let inside = serde_json::json!({ "command": "rm -rf out" });
         assert_eq!(
-            evaluate(PermissionMode::Full, "shell", &inside, Some(&w), None).decision,
+            evaluate(PermissionMode::Full, "shell", &inside, Some(&w), None, None).decision,
             Decision::Allow
         );
         assert_eq!(
-            evaluate(PermissionMode::Smart, "shell", &inside, Some(&w), None).decision,
+            evaluate(PermissionMode::Smart, "shell", &inside, Some(&w), None, None).decision,
             Decision::Ask
         );
         assert_eq!(
-            evaluate(PermissionMode::Ask, "fs_read", &serde_json::json!({"path": "a.txt"}), Some(&w), None)
+            evaluate(PermissionMode::Ask, "fs_read", &serde_json::json!({"path": "a.txt"}), Some(&w), None, None)
                 .decision,
             Decision::Ask
         );
@@ -918,7 +1361,7 @@ mod tests {
 
     #[test]
     fn no_workspace_denies() {
-        let e = evaluate(PermissionMode::Full, "shell", &serde_json::json!({"command":"ls"}), None, None);
+        let e = evaluate(PermissionMode::Full, "shell", &serde_json::json!({"command":"ls"}), None, None, None);
         assert_eq!(e.decision, Decision::Deny);
     }
 
@@ -928,7 +1371,7 @@ mod tests {
         let outside = serde_json::json!({ "path": "/etc/hosts" });
         assert!(!path_risks("/etc/hosts", &w, "write").is_empty());
         assert_eq!(
-            evaluate(PermissionMode::Full, "fs_write", &outside, Some(&w), None).decision,
+            evaluate(PermissionMode::Full, "fs_write", &outside, Some(&w), None, None).decision,
             Decision::Ask
         );
         assert!(path_risks("notes/plan.md", &w, "write").is_empty());
@@ -956,7 +1399,7 @@ mod api_tests {
     fn every_api_call_asks_in_every_mode() {
         for mode in [PermissionMode::Ask, PermissionMode::Smart, PermissionMode::Full] {
             let target = ApiTarget::Ready(info("read"));
-            let e = evaluate(mode, "call_api", &serde_json::json!({}), None, Some(&target));
+            let e = evaluate(mode, "call_api", &serde_json::json!({}), None, Some(&target), None);
             assert_eq!(e.decision, Decision::Ask, "mode {:?} must still ask", mode);
         }
     }
@@ -969,6 +1412,7 @@ mod api_tests {
             &serde_json::json!({}),
             None,
             Some(&ApiTarget::Ready(info("write"))),
+            None,
         );
         assert!(e.title.contains("Apify") && e.title.contains("Run Actor"));
         assert!(e.detail.contains("POST"));
@@ -983,6 +1427,7 @@ mod api_tests {
             &serde_json::json!({}),
             None,
             Some(&ApiTarget::Ready(info("read"))),
+            None,
         );
         let kinds: Vec<&str> = read_only.risks.iter().map(|r| r.kind.as_str()).collect();
         assert!(!kinds.contains(&"external_side_effect"));
@@ -990,7 +1435,7 @@ mod api_tests {
 
     #[test]
     fn an_unconnected_api_is_denied_outright() {
-        let e = evaluate(PermissionMode::Full, "call_api", &serde_json::json!({}), None, None);
+        let e = evaluate(PermissionMode::Full, "call_api", &serde_json::json!({}), None, None, None);
         assert_eq!(e.decision, Decision::Deny);
     }
 
@@ -1008,6 +1453,7 @@ mod api_tests {
             &serde_json::json!({}),
             None,
             Some(&target),
+            None,
         );
         assert_eq!(e.decision, Decision::Deny);
         let told = format!("{} {}", e.detail, e.risks[0].message);
@@ -1024,16 +1470,157 @@ mod api_tests {
             &serde_json::json!({}),
             None,
             Some(&target),
+            None,
         );
         assert_eq!(e.decision, Decision::Deny);
         assert!(e.risks[0].message.contains("APIs panel"));
     }
 
     #[test]
+    fn asking_the_user_something_never_needs_approval() {
+        let args = serde_json::json!({
+            "question": "What kind of music should I use?",
+            "options": [{ "label": "A song from my computer" }, { "label": "Find one for me" }]
+        });
+        for mode in [PermissionMode::Ask, PermissionMode::Smart, PermissionMode::Full] {
+            // Not even a workspace: a question touches nothing.
+            let e = evaluate(mode, "ask_user", &args, None, None, None);
+            assert_eq!(e.decision, Decision::Allow);
+            assert!(e.risks.is_empty(), "{:?}", e.risks);
+            assert!(e.detail.contains("music"), "{}", e.detail);
+        }
+    }
+
+    #[test]
     fn reading_the_catalogue_does_not_need_a_workspace_or_approval() {
-        for tool in ["list_apis", "search_api_capabilities", "read_api_docs", "find_models"] {
-            let e = evaluate(PermissionMode::Ask, tool, &serde_json::json!({}), None, None);
+        for tool in [
+            "list_apis",
+            "search_api_capabilities",
+            "read_api_docs",
+            "find_models",
+            "list_connected_apps",
+            "search_app_tools",
+        ] {
+            let e = evaluate(PermissionMode::Ask, tool, &serde_json::json!({}), None, None, None);
             assert_eq!(e.decision, Decision::Allow, "{} should be free", tool);
         }
+    }
+
+    // ------------------------------------------------- connected app actions
+
+    fn app_info() -> AppCallInfo {
+        AppCallInfo {
+            app_name: "Gmail".into(),
+            tool_slug: "GMAIL_SEND_EMAIL".into(),
+            action: "Send email".into(),
+            purpose: "Send the render link to the client".into(),
+            argument_names: vec!["recipient_email".into(), "subject".into()],
+        }
+    }
+
+    #[test]
+    fn acting_on_a_connected_app_always_asks_even_under_full_autonomy() {
+        for mode in [PermissionMode::Ask, PermissionMode::Smart, PermissionMode::Full] {
+            let target = AppTarget::Ready(app_info());
+            let e = evaluate(
+                mode,
+                "run_app_tool",
+                &serde_json::json!({}),
+                None,
+                None,
+                Some(&target),
+            );
+            assert_eq!(
+                e.decision,
+                Decision::Ask,
+                "someone's real account is never touched unattended"
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_prompt_says_which_account_and_what_is_sent() {
+        let target = AppTarget::Ready(app_info());
+        let e = evaluate(
+            PermissionMode::Smart,
+            "run_app_tool",
+            &serde_json::json!({}),
+            None,
+            None,
+            Some(&target),
+        );
+        assert!(e.title.contains("Gmail") && e.title.contains("Send email"), "{}", e.title);
+        assert!(e.detail.contains("Send the render link"), "{}", e.detail);
+        assert!(e.detail.contains("GMAIL_SEND_EMAIL"), "{}", e.detail);
+
+        let kinds: Vec<&str> = e.risks.iter().map(|r| r.kind.as_str()).collect();
+        assert!(kinds.contains(&"connected_app"));
+        let params = e.risks.iter().find(|r| r.kind == "parameters").unwrap();
+        assert!(params.message.contains("recipient_email"), "{}", params.message);
+    }
+
+    #[test]
+    fn an_app_that_is_not_connected_is_denied_and_says_where_to_connect_it() {
+        let target = AppTarget::NotConnected { app: "gmail".into() };
+        let e = evaluate(
+            PermissionMode::Full,
+            "run_app_tool",
+            &serde_json::json!({}),
+            None,
+            None,
+            Some(&target),
+        );
+        assert_eq!(e.decision, Decision::Deny);
+        assert!(e.risks[0].message.contains("Apps panel"), "{}", e.risks[0].message);
+    }
+
+    #[test]
+    fn a_connected_app_that_cannot_run_is_not_reported_as_missing() {
+        let target = AppTarget::Unusable {
+            app_name: "Gmail".into(),
+            reason: "The Gmail connection has expired. Reconnect it in the Apps panel.".into(),
+        };
+        let e = evaluate(
+            PermissionMode::Full,
+            "run_app_tool",
+            &serde_json::json!({}),
+            None,
+            None,
+            Some(&target),
+        );
+        assert_eq!(e.decision, Decision::Deny);
+        let told = format!("{} {}", e.detail, e.risks[0].message);
+        assert!(told.contains("expired"), "the real reason must survive: {}", told);
+        assert!(!told.contains("is not connected"), "it is connected: {}", told);
+    }
+
+    #[test]
+    fn a_missing_composio_key_is_reported_as_its_own_failure() {
+        let target = AppTarget::Unavailable {
+            reason: "No Composio API key is configured.".into(),
+        };
+        let e = evaluate(
+            PermissionMode::Full,
+            "run_app_tool",
+            &serde_json::json!({}),
+            None,
+            None,
+            Some(&target),
+        );
+        assert_eq!(e.decision, Decision::Deny);
+        assert_eq!(e.risks[0].kind, "apps_unavailable");
+    }
+
+    #[test]
+    fn an_app_action_with_no_target_is_denied_rather_than_assumed() {
+        let e = evaluate(
+            PermissionMode::Full,
+            "run_app_tool",
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.decision, Decision::Deny);
     }
 }

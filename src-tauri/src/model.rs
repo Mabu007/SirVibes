@@ -155,7 +155,11 @@ pub async fn chat(
     }
 
     let mut acc = Accumulator::default();
-    let mut buffer = String::new();
+    // Bytes, not text. A chunk boundary falls wherever the network put it, and
+    // decoding each chunk on its own turns a character unlucky enough to
+    // straddle two of them into a replacement character. Whole lines are
+    // decoded; a partial one waits for the rest.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -163,18 +167,18 @@ pub async fn chat(
             return Err("cancelled".into());
         }
         let bytes = chunk.map_err(|e| format!("stream interrupted: {}", e))?;
-        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        buffer.extend_from_slice(&bytes);
 
-        while let Some(idx) = buffer.find('\n') {
-            let line = buffer[..idx].to_string();
-            buffer.drain(..idx + 1);
+        while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..idx]).into_owned();
+            buffer.drain(..=idx);
             for (kind, text) in acc.push_line(&line)? {
                 emit(app, stream_id, kind, &text);
             }
         }
     }
     // A final line with no trailing newline.
-    for (kind, text) in acc.push_line(&buffer)? {
+    for (kind, text) in acc.push_line(&String::from_utf8_lossy(&buffer))? {
         emit(app, stream_id, kind, &text);
     }
 
@@ -493,6 +497,43 @@ mod tests {
             out.extend(acc.push_line(line).unwrap());
         }
         out
+    }
+
+    /// The same rule as the shell runner: bytes arrive split wherever they
+    /// were split, and a character is not allowed to be a casualty of that.
+    #[test]
+    fn a_character_split_across_two_network_chunks_arrives_whole() {
+        let payload = br#"data: {"choices":[{"delta":{"content":"an em dash "}}]}"#;
+        let dash = "—".as_bytes(); // three bytes, split across the two chunks
+        let mut first = payload.to_vec();
+        first.truncate(first.len() - 5);
+
+        // Reassemble exactly as `chat` does.
+        let mut buffer: Vec<u8> = Vec::new();
+        let chunks: Vec<Vec<u8>> = vec![
+            br#"data: {"choices":[{"delta":{"content":"em "#.to_vec(),
+            dash[..1].to_vec(),
+            [&dash[1..], br#" dash"}}]}"#.as_slice(), b"\n"].concat(),
+        ];
+        let mut lines = Vec::new();
+        for chunk in chunks {
+            buffer.extend_from_slice(&chunk);
+            while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
+                lines.push(String::from_utf8_lossy(&buffer[..idx]).into_owned());
+                buffer.drain(..=idx);
+            }
+        }
+
+        let mut acc = Accumulator::default();
+        let mut text = String::new();
+        for line in &lines {
+            for (_, chunk) in acc.push_line(line).unwrap() {
+                text.push_str(&chunk);
+            }
+        }
+        assert_eq!(text, "em — dash");
+        assert!(!text.contains('\u{fffd}'), "the dash was broken by the chunking");
+        let _ = first;
     }
 
     #[test]

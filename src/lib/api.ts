@@ -3,6 +3,8 @@ import type {
   ApiInput,
   ApiUsage,
   ApiView,
+  AppsStatus,
+  AppView,
   Artifact,
   AssistantMessage,
   Capability,
@@ -11,11 +13,13 @@ import type {
   ConversationSummary,
   Evaluation,
   ImportReport,
+  ConnectStarted,
   ModelInfo,
   SettingsPatch,
   SettingsView,
   Skill,
   SkillDir,
+  Toolkit,
 } from "./types";
 
 export const api = {
@@ -38,7 +42,7 @@ export const api = {
 
   evaluateTool: (tool: string, args: unknown) => invoke<Evaluation>("evaluate_tool", { tool, args }),
   runTool: (tool: string, args: unknown, callId: string, userApproved: boolean) =>
-    invoke<{ ok: boolean; result?: unknown; error?: string }>("run_tool", {
+    invoke<{ ok: boolean; cancelled?: boolean; result?: unknown; error?: string }>("run_tool", {
       tool,
       args,
       callId,
@@ -58,6 +62,19 @@ export const api = {
   apiRediscover: (id: string) => invoke<ApiView>("api_rediscover", { id }),
   apiTest: (id: string) => invoke<ApiView>("api_test", { id }),
   apiUsage: () => invoke<ApiUsage[]>("api_usage"),
+
+  // Connected apps. The Composio key stays in the backend; only whether one is
+  // configured ever crosses this boundary.
+  appsStatus: () => invoke<AppsStatus>("apps_status"),
+  appsSetKey: (key: string) => invoke<AppsStatus>("apps_set_key", { key }),
+  appsClearKey: () => invoke<AppsStatus>("apps_clear_key"),
+  appsCatalog: (search: string) => invoke<Toolkit[]>("apps_catalog", { search }),
+  appsList: () => invoke<AppView[]>("apps_list"),
+  appsRefresh: () => invoke<AppView[]>("apps_refresh"),
+  appsConnect: (toolkitSlug: string) =>
+    invoke<ConnectStarted>("apps_connect", { toolkitSlug }),
+  appsCheck: (toolkitSlug: string) => invoke<AppView>("apps_check", { toolkitSlug }),
+  appsDisconnect: (toolkitSlug: string) => invoke<void>("apps_disconnect", { toolkitSlug }),
 
   scanArtifacts: (sinceMs: number) => invoke<Artifact[]>("scan_artifacts", { sinceMs }),
   openPath: (path: string) => invoke<void>("open_path", { path }),

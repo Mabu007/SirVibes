@@ -2,26 +2,38 @@
 
 mod api_call;
 mod apis;
+mod apps;
 mod artifacts;
+mod composio;
 mod deepgram;
 mod generate;
+mod jobs;
+mod machine;
+mod memory;
 mod model;
+mod output;
 mod permissions;
+mod reference;
+#[cfg(test)]
+mod pipeline_e2e;
 mod secrets;
 mod settings;
 mod skills;
 mod tools;
 mod tools_fs;
 mod tools_shell;
+mod vision;
 mod workspace;
 
 use api_call::{ApiRequest, CallGuard, CallLimits};
 use apis::{ApiConnection, ApiRegistry, ApiView, AuthConfig};
+use apps::{AppRegistry, AppView, ConnectedApp};
+use composio::Composio;
 use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use settings::{Settings, SettingsPatch, SettingsView};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
@@ -34,8 +46,14 @@ struct AppState {
     user_skills_dir: PathBuf,
     resources_dir: Option<PathBuf>,
     cancel: model::Cancellations,
-    processes: tools_shell::ProcessRegistry,
+    /// Every tool call currently running, so Stop has one place to look.
+    jobs: jobs::Jobs,
     apis: ApiRegistry,
+    connected_apps: AppRegistry,
+    /// What each connected app can do. Filled the first time the agent asks,
+    /// then reused — including by the system prompt, which is rebuilt every
+    /// turn and cannot go to the network.
+    app_tools: apps::ToolInventory,
     secrets: SecretStore,
     call_guard: CallGuard,
 }
@@ -59,6 +77,20 @@ impl AppState {
             &s.skill_dirs,
             ws.as_ref().map(|w| w.root.as_path()),
         )
+    }
+
+    /// The identity connected apps belong to. Created and persisted the first
+    /// time anything asks for it, so a fresh install does not need a setup step
+    /// before it can connect an app.
+    fn composio_user(&self) -> String {
+        let mut settings = self.settings.lock().expect("settings lock");
+        let (id, created) = settings.ensure_composio_user_id();
+        if created {
+            let snapshot = settings.clone();
+            drop(settings);
+            let _ = snapshot.save(&self.settings_path);
+        }
+        id
     }
 
     fn persist(&self) -> Result<SettingsView, String> {
@@ -186,6 +218,10 @@ struct Capability {
 
 const PROBED: &[(&str, &str)] = &[
     ("ffmpeg", "encode, transcode, cut, filter, render"),
+    (
+        "hyperframes",
+        "render HTML/CSS/JS compositions to video, including transparent overlays for captions and motion graphics",
+    ),
     ("ffprobe", "inspect media streams and metadata"),
     ("python3", "scripting, data work, custom processing"),
     ("node", "scripting"),
@@ -207,14 +243,33 @@ fn find_program(name: &str) -> Option<PathBuf> {
 
 #[tauri::command]
 fn list_capabilities() -> Vec<Capability> {
-    PROBED
+    let mut found: Vec<Capability> = PROBED
         .iter()
         .map(|(name, detail)| Capability {
             name: name.to_string(),
             available: find_program(name).is_some(),
             detail: detail.to_string(),
         })
-        .collect()
+        .collect();
+
+    // HyperFrames ships on npm rather than as a system package, and it is how
+    // captions and motion graphics are made here. If it is not installed but
+    // npm is, it is still reachable — say so, with the command that reaches it,
+    // rather than reporting the machine cannot do the work.
+    if let Some(hyperframes) = found.iter_mut().find(|c| c.name == "hyperframes") {
+        if !hyperframes.available && find_program("npx").is_some() {
+            hyperframes.available = true;
+            hyperframes.detail = format!(
+                "{} — not installed, but reachable as `npx -y hyperframes@latest <command>`. That \
+                 costs about 10 seconds of package resolution on every call, twice per render job; \
+                 `npm i -g hyperframes` once removes it. Mention that to the user if they are \
+                 waiting on renders — do not install it for them.",
+                hyperframes.detail
+            );
+        }
+    }
+
+    found
 }
 
 // ----------------------------------------------------------- system prompt
@@ -286,12 +341,64 @@ fn get_system_prompt(state: State<AppState>) -> String {
         }
     };
 
-    let capability_list = list_capabilities()
-        .into_iter()
-        .filter(|c| c.available)
-        .map(|c| format!("- {} — {}", c.name, c.detail))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let app_list = {
+        if !composio::is_configured(&state.secrets) {
+            "(connected apps are not set up on this machine — the user adds a Composio API key in SirVibe's Apps panel, in the sidebar)".to_string()
+        } else {
+            let user = state.composio_user();
+            let apps = state.connected_apps.for_user(&user);
+            if apps.is_empty() {
+                "(none connected — the user connects apps in SirVibe's Apps panel, in the sidebar)"
+                    .to_string()
+            } else {
+                apps.iter()
+                    .map(|a| {
+                        let state_note = if a.status == "ACTIVE" {
+                            String::new()
+                        } else {
+                            format!(" — {}, not usable until reconnected", a.status.to_lowercase())
+                        };
+                        // What it can do, when that has been loaded: the
+                        // agent should know an app's shape before it starts
+                        // guessing search terms for it.
+                        let can_do = state
+                            .app_tools
+                            .summary(&a.toolkit_slug)
+                            .map(|s| format!(" — {}", s))
+                            .unwrap_or_else(|| {
+                                " — call list_connected_apps to see what it can do".to_string()
+                            });
+                        format!(
+                            "- {} (app_id: {}){}{}",
+                            a.name, a.toolkit_slug, state_note, can_do
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    };
+
+    // What the machine is, then what is installed on it. The first line changes
+    // what the agent should attempt; the rest is what it has to work with.
+    let capability_list = {
+        let mut lines = vec![format!("- this machine — {}", machine::summary())];
+        if let Some(encoder) = machine::hardware_encoder() {
+            lines.push(format!(
+                "- {} — hardware video encoding, tested and working here: `{}`. Use it for a long \
+                 final encode; libx264 stays the safe default for anything short or fussy.",
+                encoder.name,
+                encoder.command_hint()
+            ));
+        }
+        lines.extend(
+            list_capabilities()
+                .into_iter()
+                .filter(|c| c.available)
+                .map(|c| format!("- {} — {}", c.name, c.detail)),
+        );
+        lines.join("\n")
+    };
 
     let mode = match s.permission_mode {
         settings::PermissionMode::Ask => {
@@ -305,7 +412,26 @@ fn get_system_prompt(state: State<AppState>) -> String {
         }
     };
 
+    // What is already known, at the top of every turn. Recall the agent has to
+    // remember to ask for is recall that does not happen.
+    let remembered = memory::recall_block(
+        &state.data_dir,
+        state.workspace().map(|w| w.root).as_deref(),
+    );
+    let memory_block = if remembered.is_empty() {
+        "(nothing remembered yet — use `remember` when you learn something durable about this \
+         person or this project)"
+            .to_string()
+    } else {
+        format!(
+            "{}\n\nThis is what you already know. Do not ask for it again, and do not read it back \
+             to the user unprompted. Correct it with `remember` when it turns out to be wrong.",
+            remembered
+        )
+    };
+
     template
+        .replace("{{MEMORY}}", &memory_block)
         .replace("{{WORKSPACE}}", &workspace_line)
         .replace("{{SKILLS}}", &skill_list)
         .replace(
@@ -317,6 +443,7 @@ fn get_system_prompt(state: State<AppState>) -> String {
             },
         )
         .replace("{{APIS}}", &api_list)
+        .replace("{{APPS}}", &app_list)
         .replace("{{PERMISSION_MODE}}", mode)
         .replace("{{PLATFORM}}", std::env::consts::OS)
 }
@@ -699,18 +826,346 @@ fn api_call_info(state: &AppState, args: &Value) -> Option<permissions::ApiTarge
     }))
 }
 
+// ---------------------------------------------------------- connected apps
+//
+// Composio brokers OAuth to third-party applications. The project API key is
+// held in the same secret store as every other credential and never crosses the
+// IPC boundary; the interface is told only whether one is configured.
+
+#[derive(Serialize)]
+struct AppsStatus {
+    configured: bool,
+    /// Enough to recognise the stored key, never enough to use it.
+    key_hint: String,
+    /// True when the key came from the environment rather than the vault, so
+    /// the interface can explain why there is nothing to edit.
+    from_environment: bool,
+}
+
+fn apps_status_of(state: &AppState) -> AppsStatus {
+    let stored = state.secrets.has(composio::SECRET_ID);
+    AppsStatus {
+        configured: composio::is_configured(&state.secrets),
+        key_hint: state.secrets.hint(composio::SECRET_ID),
+        from_environment: !stored && std::env::var(composio::ENV_KEY).is_ok(),
+    }
+}
+
+#[tauri::command]
+fn apps_status(state: State<AppState>) -> AppsStatus {
+    apps_status_of(&state)
+}
+
+/// Store the Composio key, but only after it has been shown to work. A key that
+/// is saved and then silently fails every call is worse than one refused at the
+/// door.
+#[tauri::command]
+async fn apps_set_key(state: State<'_, AppState>, key: String) -> Result<AppsStatus, String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("Enter a Composio API key.".into());
+    }
+    Composio::new(key.clone())?.verify().await?;
+    state.secrets.put(composio::SECRET_ID, &key)?;
+    Ok(apps_status_of(&state))
+}
+
+#[tauri::command]
+fn apps_clear_key(state: State<AppState>) -> Result<AppsStatus, String> {
+    state.secrets.remove(composio::SECRET_ID)?;
+    Ok(apps_status_of(&state))
+}
+
+/// Browse what Composio can connect to. The search runs on Composio's side, so
+/// the catalogue is never downloaded and no app list is hardcoded here.
+#[tauri::command]
+async fn apps_catalog(
+    state: State<'_, AppState>,
+    search: Option<String>,
+) -> Result<Vec<composio::Toolkit>, String> {
+    let client = Composio::from_secrets(&state.secrets)?;
+    client.list_toolkits(search.as_deref(), 40).await
+}
+
+/// What this user has connected, from the local record alone. Instant, and
+/// works with no network.
+#[tauri::command]
+fn apps_list(state: State<AppState>) -> Vec<AppView> {
+    let user = state.composio_user();
+    state
+        .connected_apps
+        .for_user(&user)
+        .iter()
+        .map(ConnectedApp::view)
+        .collect()
+}
+
+/// Reconcile the local record against Composio. This is where a connection that
+/// was revoked or expired elsewhere stops being reported as working.
+#[tauri::command]
+async fn apps_refresh(state: State<'_, AppState>) -> Result<Vec<AppView>, String> {
+    let user = state.composio_user();
+    let client = Composio::from_secrets(&state.secrets)?;
+    let live = client.connections_for(&user).await?;
+
+    for mut app in state.connected_apps.for_user(&user) {
+        // Match on the connection id first, then on the app, so a connection
+        // remade elsewhere is still picked up.
+        let found = live
+            .iter()
+            .find(|c| c.id == app.connected_account_id)
+            .or_else(|| live.iter().find(|c| c.toolkit_slug == app.toolkit_slug));
+        match found {
+            Some(current) => {
+                app.connected_account_id = current.id.clone();
+                app.status = current.status.clone();
+                app.status_reason = current.status_reason.clone();
+                if current.is_disabled {
+                    app.status_reason = Some("disabled in Composio".to_string());
+                }
+                app.updated_ms = apis::now_ms();
+                state.connected_apps.upsert(app)?;
+            }
+            None => {
+                // Composio no longer has it: it was disconnected outside
+                // SirVibe. Drop the stale row rather than showing it as live.
+                state.connected_apps.remove(&user, &app.toolkit_slug)?;
+            }
+        }
+    }
+
+    Ok(state
+        .connected_apps
+        .for_user(&user)
+        .iter()
+        .map(ConnectedApp::view)
+        .collect())
+}
+
+#[derive(Serialize)]
+struct ConnectStarted {
+    toolkit_slug: String,
+    name: String,
+    /// Where the user was sent to sign in. Returned so the interface can offer
+    /// the link again if the browser did not come to the front.
+    redirect_url: String,
+    expires_at: Option<String>,
+}
+
+/// Begin an OAuth flow: register the app for this project if it has not been
+/// registered, ask Composio for a sign-in link scoped to this user, and open it
+/// in the real browser. Composio hosts the callback, so SirVibe needs no local
+/// web server and no redirect URI of its own.
+#[tauri::command]
+async fn apps_connect(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    toolkit_slug: String,
+) -> Result<ConnectStarted, String> {
+    let slug = toolkit_slug.trim().to_lowercase();
+    if slug.is_empty() {
+        return Err("Choose an app to connect.".into());
+    }
+    let user = state.composio_user();
+    let client = Composio::from_secrets(&state.secrets)?;
+
+    let toolkit = client.get_toolkit(&slug).await?;
+    if !toolkit.connectable {
+        return Err(format!(
+            "{} cannot be connected with Composio's own sign-in. It needs OAuth credentials registered in the Composio dashboard first.",
+            toolkit.name
+        ));
+    }
+
+    let auth_config_id = client.ensure_auth_config(&slug).await?;
+    let session = client.create_link(&auth_config_id, &user).await?;
+
+    state.connected_apps.upsert(ConnectedApp {
+        toolkit_slug: slug.clone(),
+        name: toolkit.name.clone(),
+        logo: toolkit.logo.clone(),
+        connected_account_id: session.connected_account_id.clone(),
+        auth_config_id,
+        user_id: user,
+        status: "INITIATED".into(),
+        status_reason: None,
+        connected_ms: apis::now_ms(),
+        updated_ms: apis::now_ms(),
+    })?;
+
+    // Sign-in happens in the user's own browser, where their existing sessions
+    // and password manager are, never in a window SirVibe controls.
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app_handle
+            .opener()
+            .open_url(session.redirect_url.clone(), None::<&str>)
+            .map_err(|e| {
+                format!(
+                    "Could not open the browser to sign in to {}: {}",
+                    toolkit.name, e
+                )
+            })?;
+    }
+
+    Ok(ConnectStarted {
+        toolkit_slug: slug,
+        name: toolkit.name,
+        redirect_url: session.redirect_url,
+        expires_at: session.expires_at,
+    })
+}
+
+/// Ask Composio whether a sign-in that was started has completed. The interface
+/// calls this while the user is in the browser; it is one cheap read.
+#[tauri::command]
+async fn apps_check(state: State<'_, AppState>, toolkit_slug: String) -> Result<AppView, String> {
+    let user = state.composio_user();
+    let slug = toolkit_slug.trim().to_lowercase();
+    let mut record = state
+        .connected_apps
+        .get(&user, &slug)
+        .ok_or_else(|| format!("{} is not being connected.", slug))?;
+
+    let client = Composio::from_secrets(&state.secrets)?;
+    let current = client.connection(&record.connected_account_id).await?;
+
+    record.status = current.status.clone();
+    record.status_reason = current.status_reason.clone();
+    record.updated_ms = apis::now_ms();
+    if current.usable() {
+        record.connected_ms = apis::now_ms();
+    }
+    state.connected_apps.upsert(record.clone())?;
+    Ok(record.view())
+}
+
+/// Disconnect an app: revoke it at Composio, then forget it locally. The local
+/// row is dropped even when the remote call fails, so a connection that no
+/// longer works cannot be left stuck in the list, but the failure is still
+/// reported rather than swallowed.
+#[tauri::command]
+async fn apps_disconnect(state: State<'_, AppState>, toolkit_slug: String) -> Result<(), String> {
+    // Whatever happens below, this app's actions are no longer ours to offer.
+    state.app_tools.forget(&toolkit_slug);
+    let user = state.composio_user();
+    let slug = toolkit_slug.trim().to_lowercase();
+    let record = state
+        .connected_apps
+        .get(&user, &slug)
+        .ok_or_else(|| format!("{} is not connected.", slug))?;
+
+    let revoked = match Composio::from_secrets(&state.secrets) {
+        Ok(client) => client.disconnect(&record.connected_account_id).await,
+        Err(e) => Err(e),
+    };
+    state.connected_apps.remove(&user, &slug)?;
+
+    revoked.map_err(|e| {
+        format!(
+            "{} was removed from SirVibe, but Composio could not be told to revoke it: {}",
+            record.name, e
+        )
+    })
+}
+
+/// Describe a pending connected-app action for the approval prompt. Built from
+/// the local registry only, so no network call sits between the model asking
+/// and the user being shown what it asked for.
+///
+/// Composio names every tool `<TOOLKIT>_<ACTION>`, so the app a slug belongs to
+/// is readable without a lookup. Execution re-checks the connection against
+/// Composio regardless, so this is a description, not the security boundary.
+fn app_call_info(state: &AppState, args: &Value) -> Option<permissions::AppTarget> {
+    use permissions::{AppCallInfo, AppTarget};
+
+    let tool_slug = args
+        .get("tool_slug")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
+    if tool_slug.is_empty() {
+        return None;
+    }
+
+    if !composio::is_configured(&state.secrets) {
+        return Some(AppTarget::Unavailable {
+            reason: "No Composio API key is configured, so connected apps are unavailable. The user adds one in SirVibe's Apps panel, in the sidebar.".into(),
+        });
+    }
+
+    let user = state.composio_user();
+    let connected = state.connected_apps.for_user(&user);
+    let owner = connected
+        .iter()
+        .find(|a| tool_slug.starts_with(&format!("{}_", a.toolkit_slug.to_uppercase())));
+
+    let app = match owner {
+        Some(app) => app,
+        None => {
+            let guess = tool_slug
+                .split('_')
+                .next()
+                .unwrap_or(&tool_slug)
+                .to_lowercase();
+            return Some(AppTarget::NotConnected { app: guess });
+        }
+    };
+
+    if app.status != "ACTIVE" {
+        let status = composio::ConnectionStatus {
+            id: app.connected_account_id.clone(),
+            toolkit_slug: app.toolkit_slug.clone(),
+            status: app.status.clone(),
+            status_reason: app.status_reason.clone(),
+            is_disabled: false,
+        };
+        return Some(AppTarget::Unusable {
+            app_name: app.name.clone(),
+            reason: status.explain(&app.name),
+        });
+    }
+
+    let action = tool_slug
+        .strip_prefix(&format!("{}_", app.toolkit_slug.to_uppercase()))
+        .unwrap_or(&tool_slug)
+        .replace('_', " ")
+        .to_lowercase();
+
+    Some(AppTarget::Ready(AppCallInfo {
+        app_name: app.name.clone(),
+        tool_slug: tool_slug.clone(),
+        action,
+        purpose: args
+            .get("purpose")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // Names only. The values can be the user's own words and are not
+        // copied into the prompt or anywhere else.
+        argument_names: args
+            .get("arguments")
+            .and_then(Value::as_object)
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default(),
+    }))
+}
+
 // ------------------------------------------------------------- permissions
 
 #[tauri::command]
 fn evaluate_tool(state: State<AppState>, tool: String, args: Value) -> permissions::Evaluation {
     let s = state.snapshot();
     let api = api_call_info(&state, &args);
+    let app = app_call_info(&state, &args);
     permissions::evaluate(
         s.permission_mode,
         &tool,
         &args,
         state.workspace().as_ref(),
         api.as_ref(),
+        app.as_ref(),
     )
 }
 
@@ -731,12 +1186,15 @@ async fn run_tool(
     // Re-evaluate at execution time. An approval from the UI can only satisfy a
     // decision the policy itself produced; it can never widen one.
     let api = api_call_info(&state, &args);
+    // Named apart from the `app: AppHandle` parameter this function already has.
+    let app_target = app_call_info(&state, &args);
     let evaluation = permissions::evaluate(
         s.permission_mode,
         &tool,
         &args,
         ws.as_ref(),
         api.as_ref(),
+        app_target.as_ref(),
     );
     match evaluation.decision {
         permissions::Decision::Deny => {
@@ -757,64 +1215,161 @@ async fn run_tool(
         _ => {}
     }
 
+    // From here the call is going to run. Register it as a job so Stop has
+    // something to reach, and so it is cleared however the call ends.
+    let (job, _guard) = state.jobs.start(&call_id);
+
+    // A shell command watches the job itself: it has a process tree to
+    // terminate and partial output to hand back, so it must finish its own
+    // shutdown rather than being dropped mid-kill. Everything else is an HTTP
+    // request, and dropping the future cancels it.
+    // A tool call is arbitrary code driving arbitrary programs. If any of it
+    // ever panics, that must arrive as a failed tool call the agent can read
+    // and work around — not as a dead worker thread and a turn that stops with
+    // nothing to show for it.
+    let outcome = if tool == "shell" {
+        let ws = match ws {
+            Some(w) => w,
+            None => return Ok(json!({ "ok": false, "error": "No workspace is selected." })),
+        };
+        let timeout = if s.shell_timeout_secs == 0 {
+            900
+        } else {
+            s.shell_timeout_secs
+        };
+        guarded(tools_shell::run(&app, &ws, &args, &call_id, timeout, &job)).await
+    } else {
+        let work = guarded(dispatch(&app, &state, &s, ws, &tool, &args, &call_id));
+        tokio::select! {
+            result = work => result,
+            _ = job.cancelled() => {
+                eprintln!("[tool {}] cancelled · {}", call_id, tool);
+                return Ok(json!({
+                    "ok": false,
+                    "cancelled": true,
+                    "error": "The user stopped this. Do not simply retry it — say where you got to and ask.",
+                }));
+            }
+        }
+    };
+
+    // Tool failures are results, not conversation-ending errors: the model sees
+    // the failure and gets a chance to diagnose and retry. `cancelled` is on
+    // the envelope so the UI has one place to look, whichever kind of work it
+    // was.
+    let cancelled = job.is_cancelled();
+    Ok(match outcome {
+        Ok(result) => json!({ "ok": true, "cancelled": cancelled, "result": result }),
+        Err(error) => json!({ "ok": false, "cancelled": cancelled, "error": error }),
+    })
+}
+
+/// Run a piece of tool work so that a panic inside it becomes an error rather
+/// than taking the worker down with it.
+async fn guarded<F>(work: F) -> Result<Value, String>
+where
+    F: std::future::Future<Output = Result<Value, String>>,
+{
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no reason given".into());
+            eprintln!("[tool] panicked: {}", why);
+            Err(format!(
+                "The tool crashed while running: {}. This is a bug in SirVibe, not something you \
+                 did wrong — report what you were doing and try a different approach.",
+                why
+            ))
+        }
+    }
+}
+
+/// Everything a tool call does apart from running a shell command. Held in one
+/// future so that a single `select!` can drop the whole thing when the user
+/// presses Stop — dropping a reqwest future is what cancels the request.
+async fn dispatch(
+    _app: &AppHandle,
+    state: &State<'_, AppState>,
+    s: &Settings,
+    ws: Option<Workspace>,
+    tool: &str,
+    args: &Value,
+    call_id: &str,
+) -> Result<Value, String> {
     // Reading the model catalogue needs neither a workspace nor a key.
     if tool == "find_models" {
-        let outcome = find_models(&s.api_key, &args).await;
-        return Ok(match outcome {
-            Ok(result) => json!({ "ok": true, "result": result }),
-            Err(error) => json!({ "ok": false, "error": error }),
-        });
+        return find_models(&s.api_key, args).await;
     }
 
     // Capability tools need no project folder.
     if matches!(
-        tool.as_str(),
+        tool,
         "list_apis" | "search_api_capabilities" | "read_api_docs" | "call_api" | "configure_api"
     ) {
-        let outcome = run_api_tool(&state, &tool, &args, &call_id).await;
-        return Ok(match outcome {
-            Ok(result) => json!({ "ok": true, "result": result }),
-            Err(error) => json!({ "ok": false, "error": error }),
-        });
+        return run_api_tool(state, tool, args, call_id).await;
     }
 
-    let ws = match ws {
-        Some(w) => w,
-        None => return Ok(json!({ "ok": false, "error": "No workspace is selected." })),
-    };
+    // Neither do the connected-app tools: they reach the user's own accounts
+    // through Composio and never touch the local filesystem.
+    if matches!(tool, "list_connected_apps" | "search_app_tools" | "run_app_tool") {
+        return run_apps_tool(state, tool, args).await;
+    }
 
-    let outcome: Result<Value, String> = match tool.as_str() {
-        "shell" => {
-            let timeout = if s.shell_timeout_secs == 0 {
-                900
-            } else {
-                s.shell_timeout_secs
-            };
-            tools_shell::run(&app, &ws, &args, &call_id, timeout, state.processes.clone()).await
+    let ws = ws.ok_or("No workspace is selected.")?;
+
+    match tool {
+        "fs_list" => tools_fs::list(&ws, args),
+        "fs_read" => tools_fs::read(&ws, args),
+        "fs_write" => tools_fs::write(&ws, args),
+        "fs_edit" => tools_fs::edit(&ws, args),
+        "fs_mkdir" => tools_fs::mkdir(&ws, args),
+        "fs_stat" => tools_fs::stat(&ws, args),
+        "run_model" => generate::run(&ws, &s.api_key, args).await,
+        "see" => vision::see(&ws, &s.api_key, &s.vision_model, args).await,
+        "analyze_reference" => {
+            reference::analyze(&ws, &s.api_key, &s.reference_model, args).await
         }
-        "fs_list" => tools_fs::list(&ws, &args),
-        "fs_read" => tools_fs::read(&ws, &args),
-        "fs_write" => tools_fs::write(&ws, &args),
-        "fs_edit" => tools_fs::edit(&ws, &args),
-        "fs_mkdir" => tools_fs::mkdir(&ws, &args),
-        "fs_stat" => tools_fs::stat(&ws, &args),
-        "run_model" => generate::run(&ws, &s.api_key, &args).await,
-        "transcribe" => deepgram::transcribe(&ws, &s.deepgram_api_key, &args).await,
-        "speak" => deepgram::speak(&ws, &s.deepgram_api_key, &args).await,
+        "transcribe" => deepgram::transcribe(&ws, &s.deepgram_api_key, args).await,
+        "speak" => deepgram::speak(&ws, &s.deepgram_api_key, args).await,
+        "remember" => {
+            let scope = memory::Scope::parse(args.get("scope").and_then(Value::as_str).unwrap_or(""));
+            let workspace = state.workspace().map(|w| w.root.clone());
+            let path = memory::path_for(scope, &state.data_dir, workspace.as_deref()).ok_or(
+                "There is no project open to remember this against. Choose a workspace, or use \
+                 scope 'user' for something about the person rather than the project.",
+            )?;
+            let key = args.get("key").and_then(Value::as_str).unwrap_or_default();
+
+            if args.get("forget").and_then(Value::as_bool).unwrap_or(false) {
+                let removed = memory::forget(&path, key)?;
+                return Ok(json!({
+                    "scope": scope.name(),
+                    "key": key,
+                    "forgotten": removed,
+                    "note": if removed { "Gone from every future conversation." } else { "There was no note under that key." },
+                }));
+            }
+
+            let note = memory::write(&path, key, args.get("value").and_then(Value::as_str).unwrap_or(""))?;
+            Ok(json!({
+                "scope": scope.name(),
+                "key": note.key,
+                "value": note.value,
+                "note": "Kept. It will be at the top of every future conversation, so do not repeat it back to the user now.",
+            }))
+        }
         "list_skills" => Ok(json!({ "skills": skills::discover(&state.skill_dirs()) })),
         "read_skill" => {
             let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
             skills::read(&state.skill_dirs(), name).map(|content| json!({ "content": content }))
         }
         other => Err(format!("unknown tool '{}'", other)),
-    };
-
-    // Tool failures are results, not conversation-ending errors: the model sees
-    // the failure and gets a chance to diagnose and retry.
-    Ok(match outcome {
-        Ok(result) => json!({ "ok": true, "result": result }),
-        Err(error) => json!({ "ok": false, "error": error }),
-    })
+    }
 }
 
 /// Read an auth placement supplied by the model. Anything unrecognised is an
@@ -914,12 +1469,52 @@ async fn find_models(api_key: &str, args: &Value) -> Result<Value, String> {
     hits.sort_by(|a, b| b.0.cmp(&a.0));
     let matches: Vec<Value> = hits.into_iter().take(40).map(|(_, v)| v).collect();
 
-    let note = if matches.is_empty() {
-        "Nothing matched. OpenRouter's catalogue does not carry every kind of model — if the user wants something it does not list, a connected API is the way to reach it."
-    } else {
-        "Use one of these ids verbatim with run_model. Check 'produces' before relying on a model for media."
-    };
-    Ok(json!({ "matches": matches, "searched": models.len(), "note": note }))
+    // An empty answer that only says "nothing matched" sends the agent round
+    // the same search eight more times. If a kind of output was asked for, say
+    // what the catalogue actually carries of it — that is the answer to the
+    // question behind the question.
+    if matches.is_empty() {
+        let alternatives: Vec<Value> = produces
+            .as_ref()
+            .map(|want| {
+                models
+                    .iter()
+                    .filter(|m| m.output_modalities.iter().any(|o| o == want))
+                    .take(20)
+                    .map(|m| json!({ "model": m.id, "name": m.name, "produces": m.output_modalities }))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let note = match (&produces, alternatives.is_empty()) {
+            (Some(want), false) => format!(
+                "Nothing matched those words. These are every model on OpenRouter that produces {} \
+                 — if the one the user named is not among them, it is not on OpenRouter at all, and \
+                 the honest answer is to say so and offer one of these or a connected API.",
+                want
+            ),
+            (Some(want), true) => format!(
+                "OpenRouter carries no model at all that produces {}. Do not keep searching — say \
+                 so plainly and look for a connected API that does it instead.",
+                want
+            ),
+            (None, _) => "Nothing matched those words. Try a broader query, or drop the filters — \
+                          the catalogue does not describe every model the way a person would."
+                .to_string(),
+        };
+        return Ok(json!({
+            "matches": [],
+            "searched": models.len(),
+            "everything_that_produces_this": alternatives,
+            "note": note,
+        }));
+    }
+
+    Ok(json!({
+        "matches": matches,
+        "searched": models.len(),
+        "note": "Use one of these ids verbatim with run_model. Check 'produces' before relying on a model for media.",
+    }))
 }
 
 /// OpenRouter quotes a price per token; per million is the number people use.
@@ -1190,6 +1785,219 @@ async fn run_api_tool(
     }
 }
 
+/// The three connected-app tools. Progressive disclosure, exactly as the API
+/// tools work: the model sees three tools no matter how many apps are connected
+/// or how many thousands of actions those apps expose. Schemas are fetched only
+/// for actions that actually matched a search, so the catalogue never enters
+/// the model's context.
+/// Everything one connected app can do, from the cache when it is there and
+/// from Composio the first time. A whole toolkit is a small list — sixteen
+/// actions for Instagram — so fetching all of it is cheaper and far more
+/// reliable than guessing search terms.
+async fn app_actions(
+    state: &AppState,
+    client: &Composio,
+    app: &str,
+) -> Result<Vec<composio::AppTool>, String> {
+    if let Some(cached) = state.app_tools.get(app) {
+        return Ok(cached);
+    }
+    let tools = client.search_tools(&[app.to_string()], None, 25).await?;
+    state.app_tools.put(app, tools.clone());
+    Ok(tools)
+}
+
+async fn run_apps_tool(state: &AppState, tool: &str, args: &Value) -> Result<Value, String> {
+    let user = state.composio_user();
+
+    match tool {
+        "list_connected_apps" => {
+            // Answered from the local record so listing is instant and works
+            // offline. Whether a connection still works is re-checked at the
+            // moment a tool runs, not here.
+            let connected = state.connected_apps.for_user(&user);
+
+            if !composio::is_configured(&state.secrets) {
+                return Ok(json!({
+                    "connected": [],
+                    "note": "Connected apps are not set up on this machine. The user adds a Composio API key in SirVibe's Apps panel, in the sidebar. Do not ask them for an app's own API key.",
+                }));
+            }
+
+            // Listing an app without saying what it can do leaves the agent
+            // guessing search terms against a keyword matcher. Each toolkit is
+            // a short list, so it comes back with the list.
+            let client = Composio::from_secrets(&state.secrets).ok();
+            let mut apps: Vec<Value> = Vec::new();
+            for app in &connected {
+                let ready = app.status == "ACTIVE";
+                let actions = match (&client, ready) {
+                    (Some(client), true) => app_actions(state, client, &app.toolkit_slug)
+                        .await
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                apps.push(json!({
+                    "app_id": app.toolkit_slug,
+                    "name": app.name,
+                    "status": app.status,
+                    "ready": ready,
+                    "action_count": actions.len(),
+                    "actions": actions
+                        .iter()
+                        .map(|t| json!({ "tool_slug": t.slug, "does": t.description }))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+
+            Ok(json!({
+                "connected": apps,
+                "note": "These are every action each connected app has — the whole list, not a search result. Pick the tool_slug that fits and run it with run_app_tool; use search_app_tools only to look one up in detail or to search a very large app. The user approves every action. If an app the task needs is missing, tell them to add it in the Apps panel — never ask for its API key.",
+            }))
+        }
+
+        "search_app_tools" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or("missing required argument 'query'")?;
+
+            let connected = state.connected_apps.for_user(&user);
+            if connected.is_empty() {
+                return Ok(json!({
+                    "matches": [],
+                    "note": "No apps are connected yet. The user connects them in SirVibe's Apps panel, in the sidebar.",
+                }));
+            }
+
+            // Restrict the search to what this user has actually connected, so
+            // the model can never be shown an action it has no way to run.
+            let requested = args.get("app").and_then(Value::as_str).map(str::to_lowercase);
+            let scope: Vec<String> = match &requested {
+                Some(app) => {
+                    if !connected.iter().any(|a| &a.toolkit_slug == app) {
+                        return Err(format!(
+                            "'{}' is not connected. Use list_connected_apps to see what is.",
+                            app
+                        ));
+                    }
+                    vec![app.clone()]
+                }
+                None => connected
+                    .iter()
+                    .filter(|a| a.status == "ACTIVE")
+                    .map(|a| a.toolkit_slug.clone())
+                    .collect(),
+            };
+            if scope.is_empty() {
+                return Ok(json!({
+                    "matches": [],
+                    "note": "No connected app is ready to use. The user may need to finish or renew a sign-in in the Apps panel.",
+                }));
+            }
+
+            let client = Composio::from_secrets(&state.secrets)?;
+            let mut found = client.search_tools(&scope, Some(query), 10).await?;
+
+            // Composio's search is a keyword match, so an ordinary question
+            // like "followers posts media insights" can come back empty for an
+            // app that plainly does it. An empty search is not evidence that a
+            // capability is missing, and must never be reported as if it were:
+            // fall back to everything the app has and let the agent choose.
+            let mut fell_back = false;
+            if found.is_empty() {
+                for app in &scope {
+                    if let Ok(all) = app_actions(state, &client, app).await {
+                        found.extend(all);
+                    }
+                }
+                fell_back = !found.is_empty();
+            }
+
+            let matches: Vec<Value> = found
+                .iter()
+                .map(|t| {
+                    json!({
+                        "tool_slug": t.slug,
+                        "app_id": t.toolkit_slug,
+                        "name": t.name,
+                        "description": t.description,
+                        "arguments": t.input_parameters,
+                    })
+                })
+                .collect();
+
+            Ok(json!({
+                "matches": matches,
+                "searched": scope,
+                "fell_back_to_full_list": fell_back,
+                "note": if matches.is_empty() {
+                    "These apps expose no actions at all — not that your words were wrong. Check with list_connected_apps that the right app is connected and ready."
+                } else if fell_back {
+                    "Nothing matched those words, so this is every action these apps have. The search is a keyword match, not a description of what is possible — read the list and pick what fits."
+                } else {
+                    "Call run_app_tool with one of these tool_slug values and arguments matching its schema."
+                },
+            }))
+        }
+
+        "run_app_tool" => {
+            let tool_slug = args
+                .get("tool_slug")
+                .and_then(Value::as_str)
+                .ok_or("missing required argument 'tool_slug'")?
+                .trim()
+                .to_uppercase();
+
+            let client = Composio::from_secrets(&state.secrets)?;
+
+            // Authoritative resolution: ask Composio which app this action
+            // really belongs to rather than trusting the slug's shape.
+            let definition = client.get_tool(&tool_slug).await?;
+            let record = state
+                .connected_apps
+                .get(&user, &definition.toolkit_slug)
+                .ok_or_else(|| {
+                    format!(
+                        "'{}' belongs to {}, which is not connected. The user connects apps in SirVibe's Apps panel, in the sidebar.",
+                        tool_slug, definition.toolkit_slug
+                    )
+                })?;
+
+            // And re-check the connection now, not when the panel last looked.
+            // A token revoked five minutes ago must fail here.
+            let current = client.connection(&record.connected_account_id).await?;
+            if !current.usable() {
+                let _ = state.connected_apps.set_status(
+                    &user,
+                    &record.toolkit_slug,
+                    &current.status,
+                    current.status_reason.clone(),
+                );
+                return Err(current.explain(&record.name));
+            }
+
+            let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
+            let data = client
+                .execute_tool(
+                    &tool_slug,
+                    &user,
+                    &record.connected_account_id,
+                    arguments,
+                )
+                .await?;
+
+            Ok(json!({
+                "app": record.name,
+                "tool_slug": tool_slug,
+                "data": data,
+            }))
+        }
+
+        other => Err(format!("unknown connected-app tool '{}'", other)),
+    }
+}
+
 // ------------------------------------------------------------------- model
 
 #[tauri::command]
@@ -1233,9 +2041,14 @@ fn cancel_stream(state: State<AppState>, stream_id: String) {
 #[tauri::command]
 fn cancel_tool(state: State<AppState>, call_id: String) -> bool {
     // Stop whichever kind of work is running under this call id.
-    let stopped_process = tools_shell::cancel(&state.processes, &call_id);
+    let stopped_job = state.jobs.cancel(&call_id);
+    // An in-flight HTTP request also has its own abort channel, so a call that
+    // is between tool and transport still stops.
     let stopped_request = state.call_guard.cancel(&call_id);
-    stopped_process || stopped_request
+    if stopped_job || stopped_request {
+        eprintln!("[job {}] cancellation requested", call_id);
+    }
+    stopped_job || stopped_request
 }
 
 // --------------------------------------------------------------- artifacts
@@ -1409,6 +2222,13 @@ fn main() {
             adopt_previous_install(&config_dir, "com.eplug.videoagent");
             adopt_previous_install(&data_dir, "com.eplug.videoagent");
 
+            // Where the uncollapsed output of a long command is kept, for when
+            // the digest the model reads is not enough to debug with.
+            tools_shell::set_log_dir(data_dir.join("logs"));
+            // Find out what this computer can encode with, off the critical
+            // path, so the first request does not wait on the probe.
+            machine::warm_up();
+
             let settings_path = settings::settings_path(&config_dir);
             let loaded = Settings::load(&settings_path);
             let resources_dir = locate_resources(&handle);
@@ -1421,8 +2241,10 @@ fn main() {
                 data_dir,
                 resources_dir,
                 cancel: Arc::new(Mutex::new(HashSet::new())),
-                processes: Arc::new(Mutex::new(HashMap::new())),
+                jobs: jobs::Jobs::new(),
                 apis: ApiRegistry::new(&config_dir),
+                connected_apps: AppRegistry::new(&config_dir),
+                app_tools: apps::ToolInventory::default(),
                 secrets: SecretStore::new(&config_dir),
                 call_guard: CallGuard::new(CallLimits::default()),
             });
@@ -1454,6 +2276,15 @@ fn main() {
             api_usage,
             api_limits_get,
             api_limits_set,
+            apps_status,
+            apps_set_key,
+            apps_clear_key,
+            apps_catalog,
+            apps_list,
+            apps_refresh,
+            apps_connect,
+            apps_check,
+            apps_disconnect,
             chat_stream,
             cancel_stream,
             cancel_tool,
@@ -1467,4 +2298,32 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running SirVibe");
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn hyperframes_is_reported_reachable_when_only_npx_is_installed() {
+        let caps = list_capabilities();
+        let hyperframes = caps
+            .iter()
+            .find(|c| c.name == "hyperframes")
+            .expect("captions and motion graphics are rendered with it");
+
+        if find_program("hyperframes").is_some() {
+            assert!(hyperframes.available);
+            assert!(!hyperframes.detail.contains("npx"), "it is installed, so say nothing about npx");
+        } else if find_program("npx").is_some() {
+            assert!(hyperframes.available, "npx reaches it, so the work is not impossible");
+            assert!(
+                hyperframes.detail.contains("npx -y hyperframes@latest"),
+                "the agent needs the command that reaches it: {}",
+                hyperframes.detail
+            );
+        } else {
+            assert!(!hyperframes.available);
+        }
+    }
 }

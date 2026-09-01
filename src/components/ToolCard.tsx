@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button, Spinner } from "@heroui/react";
-import type { Evaluation, Item } from "../lib/types";
+import type { Evaluation, Item, Question } from "../lib/types";
 import { AlertIcon, ChevronDownIcon, TerminalIcon } from "./Icons";
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
@@ -17,16 +17,21 @@ const PATHLIKE = [
   "fs_edit",
   "fs_mkdir",
   "transcribe",
+  "see",
 ];
 
 export function ToolCard({
   item,
   awaitingHere,
   onDecide,
+  askingHere,
+  onAnswer,
 }: {
   item: ToolItem;
   awaitingHere: boolean;
   onDecide: (approved: boolean) => void;
+  askingHere?: boolean;
+  onAnswer?: (answer: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
   const live = item.status === "running" && item.output.length > 0;
@@ -35,6 +40,12 @@ export function ToolCard({
   // Monospace is for things that are literally code or terminal output.
   // Everything else reads as ordinary text.
   const mono = live || VERBATIM.includes(item.name);
+
+  // A question is asked in the conversation too, for the same reason: the work
+  // that led to it is right there above it.
+  if (askingHere && item.question && onAnswer) {
+    return <QuestionCard question={item.question} onAnswer={onAnswer} />;
+  }
 
   // Approval is asked for in the conversation, where you can see what led to it.
   if (awaitingHere && item.evaluation) {
@@ -54,10 +65,12 @@ export function ToolCard({
         </span>
         <span
           className={`min-w-0 flex-1 truncate text-xs text-muted ${
-            PATHLIKE.includes(item.name) ? "font-mono" : ""
+            PATHLIKE.includes(item.name) && !live ? "font-mono" : ""
           }`}
         >
-          {item.detail}
+          {/* While something long is running, where it has got to matters more
+              than the command that started it. */}
+          {item.status === "running" && item.progress ? item.progress.summary : item.detail}
         </span>
         <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted">
           {item.summary}
@@ -136,6 +149,75 @@ function ApprovalCard({
         <Button size="sm" variant="primary" onPress={() => onDecide(true)}>
           Approve
         </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The agent stopped to ask something. Deliberately plain: the choices are
+ * outcomes a person can picture, not settings, and answering is one click.
+ */
+function QuestionCard({
+  question,
+  onAnswer,
+}: {
+  question: Question;
+  onAnswer: (answer: string | null) => void;
+}) {
+  const [other, setOther] = useState("");
+
+  return (
+    <div className="my-3 overflow-hidden rounded-xl border border-accent/50 bg-accent/[0.05]">
+      {question.context && (
+        <p className="px-3.5 pt-3 text-xs text-muted">{question.context}</p>
+      )}
+      <p className="px-3.5 pt-3 pb-1 text-[14px] font-medium text-foreground">
+        {question.question}
+      </p>
+
+      <div className="flex flex-col gap-1.5 px-3.5 pt-1.5">
+        {question.options.map((option) => (
+          <button
+            key={option.label}
+            onClick={() => onAnswer(option.label)}
+            className="rounded-xl border border-border bg-background px-3.5 py-2.5 text-left transition-colors hover:border-accent hover:bg-accent/[0.06]"
+          >
+            <span className="block text-[13.5px] font-medium text-foreground">{option.label}</span>
+            {option.detail && (
+              <span className="mt-0.5 block text-xs leading-snug text-muted">{option.detail}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {question.allowOther && (
+        <form
+          className="flex gap-2 px-3.5 pt-2.5"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (other.trim()) onAnswer(other.trim());
+          }}
+        >
+          <input
+            value={other}
+            onChange={(e) => setOther(e.target.value)}
+            placeholder="Or say what you would prefer"
+            className="min-w-0 flex-1 rounded-lg border border-field-border bg-field px-3 py-1.5 text-[13px] outline-none focus:border-accent"
+          />
+          <Button size="sm" variant="secondary" type="submit" isDisabled={!other.trim()}>
+            Send
+          </Button>
+        </form>
+      )}
+
+      <div className="flex justify-end px-3.5 py-3">
+        <button
+          onClick={() => onAnswer(null)}
+          className="text-xs text-muted underline-offset-2 hover:underline"
+        >
+          Skip — you decide
+        </button>
       </div>
     </div>
   );

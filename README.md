@@ -163,10 +163,11 @@ when_to_use: Any deliverable going out on the main channel.
 ...
 ```
 
-The four bundled skills (`video-analysis`, `shorts`, `captions`,
-`podcast-editing`) are loaded by the same loader from the same format as yours.
-There is no hidden implementation behind any of them — the captions skill is
-editorial knowledge, not a caption engine.
+The six bundled skills (`video-analysis`, `shorts`, `captions`, `hyperframes`,
+`music`, `podcast-editing`) are loaded by the same loader from the same format
+as yours. There is no hidden implementation behind any of them — the
+captions skill is editorial knowledge, and the mechanics it points at are the
+HyperFrames CLI and ffmpeg, both driven through the shell like anything else.
 
 ## Architecture
 

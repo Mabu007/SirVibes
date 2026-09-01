@@ -11,7 +11,7 @@ const ARTIFACT_EXTS: &[&str] = &[
     "mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "gif", // audio
     "wav", "mp3", "aac", "flac", "m4a", "ogg", "opus", // images
     "png", "jpg", "jpeg", "webp", "tiff", "bmp", "svg", // subtitles & documents
-    "srt", "vtt", "ass", "ssa", "md", "txt", "json", "csv", "edl", "xml", "fcpxml", "otio",
+    "srt", "vtt", "md", "txt", "json", "csv", "edl", "xml", "fcpxml", "otio",
 ];
 
 /// Filesystem timestamps come from a coarse kernel clock and can read a few
@@ -85,7 +85,7 @@ fn kind_of(ext: &str) -> &'static str {
         }
         "wav" | "mp3" | "aac" | "flac" | "m4a" | "ogg" | "opus" => "audio",
         "png" | "jpg" | "jpeg" | "webp" | "tiff" | "bmp" | "svg" => "image",
-        "srt" | "vtt" | "ass" | "ssa" => "subtitles",
+        "srt" | "vtt" => "subtitles",
         _ => "document",
     }
 }

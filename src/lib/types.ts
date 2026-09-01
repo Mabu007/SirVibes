@@ -6,6 +6,10 @@ export interface SettingsView {
   deepgram_key_set: boolean;
   deepgram_key_hint: string;
   model: string;
+  /** The model every `see` call runs on, default included. */
+  vision_model: string;
+  /** The model that watches reference videos where they live. */
+  reference_model: string;
   permission_mode: PermissionMode;
   workspace: string | null;
   skill_dirs: string[];
@@ -17,6 +21,8 @@ export interface SettingsPatch {
   api_key?: string;
   deepgram_api_key?: string;
   model?: string;
+  vision_model?: string;
+  reference_model?: string;
   permission_mode?: PermissionMode;
   workspace?: string;
   skill_dirs?: string[];
@@ -121,6 +127,33 @@ export type ChatMessage =
     }
   | { role: "tool"; tool_call_id: string; content: string };
 
+/** One thing the user can choose, described as an outcome rather than a method. */
+export interface QuestionOption {
+  label: string;
+  detail?: string;
+}
+
+/** A question the agent stopped to ask, and the answer once it has one. */
+export interface Question {
+  question: string;
+  context?: string;
+  options: QuestionOption[];
+  allowOther: boolean;
+  answer?: string;
+}
+
+/** A reading off a command's own progress output, already made readable. */
+export interface ToolProgress {
+  /** "Streaming frame — 55% · 207/375" */
+  summary: string;
+  label: string;
+  percent?: number;
+  done?: number;
+  total?: number;
+  /** How many redraws this one reading stands for. */
+  updates: number;
+}
+
 export type ToolStatus =
   | "awaiting"
   | "running"
@@ -142,6 +175,10 @@ export type Item =
       detail: string;
       purpose: string;
       status: ToolStatus;
+      /** Where a long-running command has got to, if it reports progress. */
+      progress?: ToolProgress;
+      /** Set when this call is the agent asking the user something. */
+      question?: Question;
       evaluation?: Evaluation;
       summary: string;
       output: string[];
@@ -216,4 +253,51 @@ export interface ApiUsage {
   errors: number;
   bytes_received: number;
   last_ms: number;
+}
+
+// ------------------------------------------------------------ connected apps
+
+/** One application Composio can broker a connection to. */
+export interface Toolkit {
+  slug: string;
+  name: string;
+  logo: string | null;
+  categories: string[];
+  tools_count: number;
+  no_auth: boolean;
+  composio_managed_auth_schemes: string[];
+  /** False when the app needs OAuth credentials registered in Composio first. */
+  connectable: boolean;
+}
+
+/**
+ * One app this user has connected. Carries no connection handle and no user
+ * id — those stay in the backend.
+ */
+export interface AppView {
+  toolkit_slug: string;
+  name: string;
+  logo: string | null;
+  status: string;
+  status_reason: string | null;
+  connected: boolean;
+  /** Sign-in was started but has not finished. */
+  pending: boolean;
+  connected_ms: number;
+  updated_ms: number;
+}
+
+/** Whether connected apps are set up at all. Never carries the key. */
+export interface AppsStatus {
+  configured: boolean;
+  key_hint: string;
+  /** The key came from COMPOSIO_API_KEY, so there is nothing to edit here. */
+  from_environment: boolean;
+}
+
+export interface ConnectStarted {
+  toolkit_slug: string;
+  name: string;
+  redirect_url: string;
+  expires_at: string | null;
 }

@@ -519,16 +519,18 @@ fn summarise_spec(spec: &Value) -> String {
 /// they never carry documentation.
 pub fn strip_html(html: &str) -> String {
     let mut out = String::new();
-    let mut chars = html.chars().peekable();
     let mut in_tag = false;
     let mut skip_until: Option<&str> = None;
-    let lower = html.to_lowercase();
-    let mut index = 0usize;
 
-    while let Some(c) = chars.next() {
-        index += c.len_utf8();
+    // Offsets come from the source string itself, and tags are matched without
+    // case-folding it first: lowercasing can change a string's length (İ is one
+    // character and two, depending which way you look at it), so an index taken
+    // from one and used on the other can land inside a character. That is a
+    // panic, on a page the user did not write.
+    for (at, c) in html.char_indices() {
+        let after = at + c.len_utf8();
         if let Some(tag) = skip_until {
-            if lower[index.saturating_sub(1)..].starts_with(tag) {
+            if starts_with_ignoring_case(&html[at..], tag) {
                 skip_until = None;
             }
             continue;
@@ -536,10 +538,10 @@ pub fn strip_html(html: &str) -> String {
         match c {
             '<' => {
                 in_tag = true;
-                let rest = &lower[index..];
-                if rest.starts_with("script") {
+                let rest = &html[after..];
+                if starts_with_ignoring_case(rest, "script") {
                     skip_until = Some("</script");
-                } else if rest.starts_with("style") {
+                } else if starts_with_ignoring_case(rest, "style") {
                     skip_until = Some("</style");
                 }
             }
@@ -556,9 +558,41 @@ pub fn strip_html(html: &str) -> String {
     collapsed.chars().take(MAX_DOC_CHARS).collect()
 }
 
+/// Tag matching, ASCII-insensitive, without building a second copy of the page.
+fn starts_with_ignoring_case(haystack: &str, needle: &str) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .bytes()
+            .zip(needle.bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_full_of_unicode_is_stripped_rather_than_crashed_on() {
+        // Every one of these used to be able to put a byte index inside a
+        // character: text before the tag, text inside a script, and a character
+        // whose lowercase form is a different length.
+        let html = "<p>café ☕ 日本語</p><script>var s = '█████ 50%';</script><p>after</p>";
+        let text = strip_html(html);
+        assert!(text.contains("café ☕ 日本語"), "{}", text);
+        assert!(text.contains("after"), "{}", text);
+        assert!(!text.contains("var s"), "scripts are dropped: {}", text);
+
+        // İ lowercases into two characters; indices from one string may not be
+        // used on the other.
+        let turkish = "<p>İstanbul</p><style>a{}</style><p>tail</p>";
+        let stripped = strip_html(turkish);
+        assert!(stripped.contains("İstanbul"), "{}", stripped);
+        assert!(stripped.contains("tail"), "{}", stripped);
+
+        // And an unterminated script must not run off the end.
+        assert_eq!(strip_html("<p>x</p><script>never closed"), "x");
+        assert_eq!(strip_html("<SCRIPT>hidden</SCRIPT>ok"), "ok");
+    }
 
     #[test]
     fn slugs_are_safe_and_stable() {

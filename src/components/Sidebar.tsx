@@ -2,6 +2,7 @@ import { Avatar, Button } from "@heroui/react";
 import type { ConversationSummary } from "../lib/types";
 import logoUrl from "../assets/logo.png";
 import {
+  AppsIcon,
   ChatIcon,
   FolderOpenIcon,
   PanelIcon,
@@ -24,6 +25,7 @@ export function Sidebar({
   onSkills,
   onWorkspaces,
   onApis,
+  onApps,
   onChooseFolder,
 }: {
   history: ConversationSummary[];
@@ -37,6 +39,7 @@ export function Sidebar({
   onSkills: () => void;
   onWorkspaces: () => void;
   onApis: () => void;
+  onApps: () => void;
   onChooseFolder: () => void;
 }) {
   if (collapsed) return null;
@@ -87,6 +90,7 @@ export function Sidebar({
         <NavItem icon={<SkillsIcon />} label="Skills" onClick={onSkills} />
         <NavItem icon={<ProjectsIcon />} label="Workspaces" onClick={onWorkspaces} />
         <NavItem icon={<PlugIcon />} label="APIs" onClick={onApis} />
+        <NavItem icon={<AppsIcon />} label="Apps" onClick={onApps} />
       </nav>
 
       <div className="px-4 pb-1 pt-5 text-xs font-medium text-muted">Recent</div>

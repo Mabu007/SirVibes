@@ -609,21 +609,6 @@ function summarize(tool: string, r: Record<string, unknown>): string {
       const files = list(r, "files").length;
       return files ? count(files, "file") : "text only";
     }
-    case "analyze_reference": {
-      const analysis = (r.analysis ?? {}) as Record<string, unknown>;
-      const scope = String(r.scope ?? "full");
-      const block = (analysis[scope] ?? analysis) as Record<string, unknown>;
-      const notes = block.rebuildNotes ?? analysis.rebuildNotes;
-      return [
-        `${r.model} watched ${r.url} — nothing downloaded.`,
-        typeof notes === "string" ? notes : "",
-        `Saved to ${r.saved}`,
-        JSON.stringify(analysis, null, 2),
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-    }
-
     case "see": {
       const looked = list(r, "looked_at").length;
       return looked ? `looked at ${count(looked, "image")}` : "looked";
@@ -823,6 +808,21 @@ function previewOf(tool: string, r: Record<string, unknown>): string {
       }
       if (typeof r.text === "string" && r.text.trim()) lines.push(r.text.trim());
       return lines.join("\n\n") || `${r.model} returned nothing.`;
+    }
+
+    case "analyze_reference": {
+      const analysis = (r.analysis ?? {}) as Record<string, unknown>;
+      const scope = String(r.scope ?? "full");
+      const block = (analysis[scope] ?? analysis) as Record<string, unknown>;
+      const notes = block.rebuildNotes ?? analysis.rebuildNotes;
+      return [
+        `${r.model} watched ${r.url} — nothing downloaded.`,
+        typeof notes === "string" ? notes : "",
+        `Saved to ${r.saved}`,
+        JSON.stringify(analysis, null, 2),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
     }
 
     case "see": {
